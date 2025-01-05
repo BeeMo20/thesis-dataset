@@ -1,0 +1,284 @@
+SEVERITY SMELL = 4
+
+
+package org.openmrs.layout.name;
+
+import org.apache.commons.lang3.StringUtils;
+
+import java.util.ArrayList;
+
+import java.util.List;
+
+import java.util.stream.Collectors;
+
+import org.openmrs.GlobalProperty;
+
+import org.openmrs.api.APIException;
+
+import org.openmrs.api.GlobalPropertyListener;
+
+import org.openmrs.api.context.Context;
+
+import org.openmrs.layout.LayoutSupport;
+
+import org.openmrs.util.OpenmrsConstants;
+
+import org.slf4j.Logger;
+
+import org.slf4j.LoggerFactory;
+
+public class NameSupport extends LayoutSupport<NameTemplate> implements GlobalPropertyListener {
+
+private static final Logger log = LoggerFactory.getLogger(NameSupport.class);
+
+private static NameSupport singleton;
+
+private boolean initialized = false;
+
+public NameSupport() {
+
+if (singleton == null) {
+
+singleton = this;
+
+}
+
+}
+
+public static NameSupport getInstance() {
+
+if (singleton == null) {
+
+throw new APIException("Not Yet Instantiated");
+
+} else {
+
+singleton.init();
+
+return singleton;
+
+}
+
+}
+
+private void init() {
+
+if (initialized) {
+
+return;
+
+}
+
+Context.getAdministrationService().addGlobalPropertyListener(singleton);
+
+String layoutTemplateXml = Context.getAdministrationService().getGlobalProperty(
+
+OpenmrsConstants.GLOBAL_PROPERTY_LAYOUT_NAME_TEMPLATE);
+
+NameTemplate nameTemplate = deserializeXmlTemplate(layoutTemplateXml);
+
+if (nameTemplate != null) {
+
+updateLayoutTemplates(nameTemplate);
+
+}
+
+initialized = true;
+
+}
+
+private void updateLayoutTemplates(NameTemplate nameTemplate) {
+
+if (getLayoutTemplates() == null) {
+
+setLayoutTemplates(new ArrayList<>());
+
+}
+
+List<NameTemplate> list = new ArrayList<>();
+
+list.addAll(getLayoutTemplates().stream().filter(existingTemplate -> existingTemplate.getCodeName() != nameTemplate.getCodeName()).collect(Collectors.toList()));
+
+list.add(nameTemplate);
+
+setLayoutTemplates(list);
+
+}
+
+private NameTemplate deserializeXmlTemplate(String xml) {
+
+NameTemplate nameTemplate = null;
+
+if (StringUtils.isBlank(xml)) {
+
+return null;
+
+}
+
+try {
+
+nameTemplate = Context.getSerializationService().getDefaultSerializer().deserialize(xml,
+
+NameTemplate.class);
+
+} catch (Exception e) {
+
+log.error("Error in deserializing provided name template", e);
+
+}
+
+return nameTemplate;
+
+}
+
+@Override
+
+public String getDefaultLayoutFormat() {
+
+String ret = Context.getAdministrationService().getGlobalProperty(OpenmrsConstants.GLOBAL_PROPERTY_LAYOUT_NAME_FORMAT);
+
+return (ret != null && ret.length() > 0) ? ret : defaultLayoutFormat;
+
+}
+
+@Override
+
+public boolean supportsPropertyName(String propertyName) {
+
+return OpenmrsConstants.GLOBAL_PROPERTY_LAYOUT_NAME_TEMPLATE.equals(propertyName);
+
+}
+
+@Override
+
+public void globalPropertyChanged(GlobalProperty newValue) {
+
+NameTemplate nameTemplate = deserializeXmlTemplate(newValue.getPropertyValue());
+
+if (nameTemplate != null) {
+
+updateLayoutTemplates(nameTemplate);
+
+}
+
+}
+
+@Override
+
+public void globalPropertyDeleted(String propertyName) {
+
+}
+
+}
+
+___________
+
+
+
+package org.openmrs.layout.name;
+
+import java.util.ArrayList;
+
+import java.util.List;
+
+import java.util.Map;
+
+import org.apache.commons.beanutils.BeanUtils;
+
+import org.apache.commons.lang3.StringUtils;
+
+import org.openmrs.PersonName;
+
+import org.openmrs.api.APIException;
+
+import org.openmrs.layout.LayoutSupport;
+
+import org.openmrs.layout.LayoutTemplate;
+
+public class NameTemplate extends LayoutTemplate {
+
+@Override
+
+public String getLayoutToken() {
+
+return "IS_NAME_TOKEN";
+
+}
+
+@Override
+
+public String getNonLayoutToken() {
+
+return "IS_NOT_NAME_TOKEN";
+
+}
+
+public String format(PersonName personName) {
+
+List<String> personNameLines = new ArrayList<>();
+
+List<List<Map<String, String>>> lines = getLines();
+
+String layoutToken = getLayoutToken();
+
+try {
+
+for (List<Map<String, String>> line : lines) {
+
+StringBuilder nameLine = new StringBuilder();
+
+boolean hasToken = false;
+
+for (Map<String, String> lineToken : line) {
+
+if (lineToken.get("isToken").equals(layoutToken)) {
+
+String tokenValue = BeanUtils.getProperty(personName, lineToken.get("codeName"));
+
+if (StringUtils.isNotBlank(tokenValue)) {
+
+hasToken = true;
+
+nameLine.append(tokenValue);
+
+}
+
+} else {
+
+nameLine.append(lineToken.get("displayText"));
+
+}
+
+}
+
+String nameLineString = nameLine.toString();
+
+if (StringUtils.isNotBlank(nameLineString) && hasToken) {
+
+personNameLines.add(nameLineString);
+
+}
+
+}
+
+return StringUtils.join(personNameLines, " ");
+
+}
+
+catch (Exception e) {
+
+throw new APIException("Unable to format personName " + personName.getId() + " using name template", e);
+
+}
+
+}
+
+@Override
+
+public LayoutSupport<?> getLayoutSupportInstance() {
+
+return NameSupport.getInstance();
+
+}
+
+}

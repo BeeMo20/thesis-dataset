@@ -1,0 +1,1084 @@
+Severit = 4
+
+package org.openmrs.api.context;
+import org.aopalliance.aop.Advice;
+import org.apache.commons.lang3.StringUtils;
+import org.hibernate.SessionFactory;
+import org.openmrs.Allergen;
+import org.openmrs.GlobalProperty;
+import org.openmrs.OpenmrsObject;
+import org.openmrs.PersonName;
+import org.openmrs.Privilege;
+import org.openmrs.Role;
+import org.openmrs.User;
+import org.openmrs.api.APIException;
+import org.openmrs.api.AdministrationService;
+import org.openmrs.api.CohortService;
+import org.openmrs.api.ConceptService;
+import org.openmrs.api.ConditionService;
+import org.openmrs.api.DatatypeService;
+import org.openmrs.api.DiagnosisService;
+import org.openmrs.api.EncounterService;
+import org.openmrs.api.FormService;
+import org.openmrs.api.LocationService;
+import org.openmrs.api.MedicationDispenseService;
+import org.openmrs.api.ObsService;
+import org.openmrs.api.OpenmrsService;
+import org.openmrs.api.OrderService;
+import org.openmrs.api.OrderSetService;
+import org.openmrs.api.PatientService;
+import org.openmrs.api.PersonService;
+import org.openmrs.api.ProgramWorkflowService;
+import org.openmrs.api.ProviderService;
+import org.openmrs.api.SerializationService;
+import org.openmrs.api.UserService;
+import org.openmrs.api.VisitService;
+import org.openmrs.api.db.ContextDAO;
+import org.openmrs.hl7.HL7Service;
+import org.openmrs.logic.LogicService;
+import org.openmrs.messagesource.MessageSourceService;
+import org.openmrs.module.ModuleMustStartException;
+import org.openmrs.module.ModuleUtil;
+import org.openmrs.notification.AlertService;
+import org.openmrs.notification.MessageException;
+import org.openmrs.notification.MessagePreparator;
+import org.openmrs.notification.MessageSender;
+import org.openmrs.notification.MessageService;
+import org.openmrs.notification.mail.MailMessageSender;
+import org.openmrs.notification.mail.velocity.VelocityMessagePreparator;
+import org.openmrs.scheduler.SchedulerService;
+import org.openmrs.scheduler.SchedulerUtil;
+import org.openmrs.util.ConfigUtil;
+import org.openmrs.util.DatabaseUpdateException;
+import org.openmrs.util.DatabaseUpdater;
+import org.openmrs.util.InputRequiredException;
+import org.openmrs.util.LocaleUtility;
+import org.openmrs.util.OpenmrsClassLoader;
+import org.openmrs.util.OpenmrsConstants;
+import org.openmrs.util.OpenmrsUtil;
+import org.openmrs.util.PrivilegeConstants;
+import org.openmrs.validator.ValidateUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.aop.Advisor;
+import org.springframework.beans.BeansException;
+import org.springframework.beans.factory.NoSuchBeanDefinitionException;
+import org.springframework.beans.factory.NoUniqueBeanDefinitionException;
+import javax.mail.Authenticator;
+import javax.mail.PasswordAuthentication;
+import javax.mail.Session;
+import java.sql.Connection;
+import java.text.SimpleDateFormat;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.Future;
+public class Context {
+	private static final Logger log = LoggerFactory.getLogger(Context.class);
+	private static ContextDAO contextDAO;
+	private static Session mailSession;
+	private static final ThreadLocal<Object[] > userContextHolder = new ThreadLocal<>();
+	private static volatile ServiceContext serviceContext;
+	private static Properties runtimeProperties = new Properties();
+	private static Properties configProperties = new Properties();
+	private static AuthenticationScheme authenticationScheme;
+	public Context() {
+	}
+	static ContextDAO getContextDAO() {
+		if (contextDAO == null) {
+			throw new APIException("error.context.null", (Object[]) null);
+		}
+		return contextDAO;
+	}
+	public void setContextDAO(ContextDAO dao) {
+		setDAO(dao);
+	}
+	public static void setDAO(ContextDAO dao) {
+		contextDAO = dao;
+	}
+	private static void setAuthenticationScheme() {
+		authenticationScheme = new UsernamePasswordAuthenticationScheme();
+		try {
+			authenticationScheme = Context.getServiceContext().getApplicationContext().getBean(AuthenticationScheme.class); 
+			log.info("An authentication scheme override was provided. Using this one in place of the OpenMRS default authentication scheme.");
+		}
+		catch(NoUniqueBeanDefinitionException e) {
+			log.error("Multiple authentication schemes overrides are being provided, this is currently not supported. Sticking to OpenMRS default authentication scheme.");
+		}
+		catch(NoSuchBeanDefinitionException e) {
+			log.debug("No authentication scheme override was provided. Sticking to OpenMRS default authentication scheme.");
+		}
+		catch(BeansException e){
+			log.error("Fatal error encountered when injecting the authentication scheme override. Sticking to OpenMRS default authentication scheme.");
+		}
+	}
+	public static Class<?> loadClass(String className) throws ClassNotFoundException {
+		return OpenmrsClassLoader.getInstance().loadClass(className);
+	}
+	public static void setUserContext(UserContext ctx) {
+		log.trace("Setting user context {}", ctx);
+		Object[] arr = new Object[] { ctx };
+		userContextHolder.set(arr);
+	}
+	public static void clearUserContext() {
+		log.trace("Clearing user context {}", Arrays.toString(userContextHolder.get()));
+		userContextHolder.remove();
+	}
+	public static UserContext getUserContext() {
+		Object[] arr = userContextHolder.get();
+		log.trace("Getting user context {} from userContextHolder {}", Arrays.toString(arr), userContextHolder);
+		if (arr == null) {
+			log.trace("userContext is null.");
+			throw new APIException(
+					"A user context must first be passed to setUserContext()...use Context.openSession() (and closeSession() to prevent memory leaks!) before using the API");
+		}
+		return (UserContext) userContextHolder.get()[0];
+	}
+	static ServiceContext getServiceContext() {
+		if (serviceContext == null) {
+			synchronized (Context.class) {
+				if (serviceContext == null) {
+					log.info("Creating new service context");
+					serviceContext = ServiceContext.getInstance();
+				}
+			}
+		}
+		log.trace("serviceContext: {}", serviceContext);
+		return ServiceContext.getInstance();
+	}
+	public void setServiceContext(ServiceContext ctx) {
+		setContext(ctx);
+	}
+	public static void setContext(ServiceContext ctx) {
+		serviceContext = ctx;
+	}
+	public static AuthenticationScheme getAuthenticationScheme() {
+		return authenticationScheme;
+	}
+	@Deprecated
+	public static void authenticate(String username, String password) throws ContextAuthenticationException {
+		authenticate(new UsernamePasswordCredentials(username, password));
+	}
+	public static Authenticated authenticate(Credentials credentials) throws ContextAuthenticationException {
+		if (Daemon.isDaemonThread()) {
+			log.error("Authentication attempted while operating on a "
+					+ "daemon thread, authenticating is not necessary or allowed");
+			return new BasicAuthenticated(Daemon.getDaemonThreadUser(), "No auth scheme used by Context - Daemon user is always authenticated.");
+		}
+		if (credentials == null) {
+			throw new ContextAuthenticationException("Context cannot authenticate with null credentials.");
+		}
+		return getUserContext().authenticate(credentials);
+	}
+	public static void refreshAuthenticatedUser() {
+		if (Daemon.isDaemonThread()) {
+			return;
+		}
+		log.debug("Refreshing authenticated user");
+		getUserContext().refreshAuthenticatedUser();
+	}
+	public static void becomeUser(String systemId) throws ContextAuthenticationException {
+		log.info("systemId: {}", systemId);
+		getUserContext().becomeUser(systemId);
+	}
+	public static Properties getRuntimeProperties() {
+		log.trace("getting runtime properties. size: {}", runtimeProperties.size());
+		Properties props = new Properties();
+		props.putAll(runtimeProperties);
+		return props;
+	}
+	public static void setRuntimeProperties(Properties props) {
+		runtimeProperties = props;
+	}
+	public static ConceptService getConceptService() {
+		return getServiceContext().getConceptService();
+	}
+	public static EncounterService getEncounterService() {
+		return getServiceContext().getEncounterService();
+	}
+	public static LocationService getLocationService() {
+		return getServiceContext().getLocationService();
+	}
+	public static ObsService getObsService() {
+		return getServiceContext().getObsService();
+	}
+	public static PatientService getPatientService() {
+		return getServiceContext().getPatientService();
+	}
+	public static CohortService getCohortService() {
+		return getServiceContext().getCohortService();
+	}
+	public static PersonService getPersonService() {
+		return getServiceContext().getPersonService();
+	}
+	public static ConditionService getConditionService(){
+		return getServiceContext().getConditionService();
+	}
+	public static DiagnosisService getDiagnosisService(){
+		return getServiceContext().getDiagnosisService();
+	}
+	public static MedicationDispenseService getMedicationDispenseService(){
+		return getServiceContext().getMedicationDispenseService();
+	}
+	public static HL7Service getHL7Service() {
+		return getServiceContext().getHL7Service();
+	}
+	public static UserService getUserService() {
+		return getServiceContext().getUserService();
+	}
+	public static OrderService getOrderService() {
+		return getServiceContext().getOrderService();
+	}
+	public static OrderSetService getOrderSetService() {
+		return getServiceContext().getOrderSetService();
+	}
+	public static FormService getFormService() {
+		return getServiceContext().getFormService();
+	}
+	public static SerializationService getSerializationService() {
+		return getServiceContext().getSerializationService();
+	}
+	public static LogicService getLogicService() {
+		return getServiceContext().getLogicService();
+	}
+	public static AdministrationService getAdministrationService() {
+		return getServiceContext().getAdministrationService();
+	}
+	public static MessageSourceService getMessageSourceService() {
+		return getServiceContext().getMessageSourceService();
+	}
+	public static SchedulerService getSchedulerService() {
+		return getServiceContext().getSchedulerService();
+	}
+	public static AlertService getAlertService() {
+		return getServiceContext().getAlertService();
+	}
+	public static ProgramWorkflowService getProgramWorkflowService() {
+		return getServiceContext().getProgramWorkflowService();
+	}
+	public static MessageService getMessageService() {
+		MessageService ms = getServiceContext().getMessageService();
+		try {
+			if (ms.getMessagePreparator() == null) {
+				ms.setMessagePreparator(getMessagePreparator());
+			}
+			if (ms.getMessageSender() == null) {
+				ms.setMessageSender(getMessageSender());
+			}
+		}
+		catch (Exception e) {
+			log.error("Unable to create message service due", e);
+		}
+		return ms;
+	}
+	public static Properties getMailProperties() {
+		Properties p = new Properties();
+		String prefix = "mail.";
+		for (GlobalProperty gp : getAdministrationService().getGlobalPropertiesByPrefix(prefix)) {
+			if (gp.getProperty().equals("mail.transport_protocol")) {
+				p.setProperty("mail.transport.protocol", gp.getPropertyValue());
+			}
+			else if (gp.getProperty().equals("mail.smtp_host")) {
+				p.setProperty("mail.smtp.host", gp.getPropertyValue());
+			}
+			else if (gp.getProperty().equals("mail.smtp_port")) {
+				p.setProperty("mail.smtp.port", gp.getPropertyValue());
+			}
+			else if (gp.getProperty().equals("mail.smtp_auth")) {
+				p.setProperty("mail.smtp.auth", gp.getPropertyValue());
+			}
+			else {
+				p.setProperty(gp.getProperty(), gp.getPropertyValue());
+			}
+		}
+		for (String runtimeProperty : runtimeProperties.stringPropertyNames()) {
+			if (runtimeProperty.startsWith(prefix)) {
+				p.setProperty(runtimeProperty, runtimeProperties.getProperty(runtimeProperty));
+			}
+		}
+		for (String systemProperty : System.getProperties().stringPropertyNames()) {
+			if (systemProperty.startsWith(prefix)) {
+				p.setProperty(systemProperty, System.getProperty(systemProperty));
+			}
+		}
+		return p;
+	}
+	private static Session getMailSession() {
+		if (mailSession == null) {
+			synchronized (Context.class) {
+				if (mailSession == null) {
+					Authenticator auth = new Authenticator() {
+						@Override
+						public PasswordAuthentication getPasswordAuthentication() {
+							return new PasswordAuthentication(
+								ConfigUtil.getProperty("mail.user"),
+								ConfigUtil.getProperty("mail.password")
+							);
+						}
+					};
+					mailSession = Session.getInstance(getMailProperties(), auth);
+				}
+			}
+		}
+		return mailSession;
+	}
+	private static MessageSender getMessageSender() {
+		return new MailMessageSender(getMailSession());
+	}
+	private static MessagePreparator getMessagePreparator() throws MessageException {
+		return new VelocityMessagePreparator();
+	}
+	public static User getAuthenticatedUser() {
+		if (Daemon.isDaemonThread()) {
+			return Daemon.getDaemonThreadUser();
+		}
+		return getUserContext().getAuthenticatedUser();
+	}
+	public static boolean isAuthenticated() {
+		if (Daemon.isDaemonThread()) {
+			return true;
+		} else {
+			try {
+				return getAuthenticatedUser() != null;
+			} catch (APIException e) {
+				log.info("Could not get authenticated user inside called to isAuthenticated(), assuming no user context has been defined", e);
+				return false;
+			}
+		}
+	}
+	public static void logout() {
+		if (!isSessionOpen()) {
+			return; 
+		}
+		log.debug("Logging out : {}", getAuthenticatedUser());
+		getUserContext().logout();
+		setUserContext(new UserContext(getAuthenticationScheme()));
+	}
+	public static Set<Role> getAllRoles(User user) throws Exception {
+		return getUserContext().getAllRoles();
+	}
+	public static boolean hasPrivilege(String privilege) {
+		if (Daemon.isDaemonThread()) {
+			return true;
+		}
+		return getUserContext().hasPrivilege(privilege);
+	}
+	public static void requirePrivilege(String privilege) throws ContextAuthenticationException {
+		if (!hasPrivilege(privilege)) {
+			String errorMessage;
+			if (StringUtils.isNotBlank(privilege)) {
+				errorMessage = Context.getMessageSourceService().getMessage("error.privilegesRequired",
+						new Object[] { privilege }, null);
+			} else {
+				errorMessage = Context.getMessageSourceService().getMessage("error.privilegesRequiredNoArgs");
+			}
+			throw new ContextAuthenticationException(errorMessage);
+		}
+	}
+	public static void addProxyPrivilege(String privilege) {
+		getUserContext().addProxyPrivilege(privilege);
+	}
+	public static void removeProxyPrivilege(String privilege) {
+		getUserContext().removeProxyPrivilege(privilege);
+	}
+	public static void setLocale(Locale locale) {
+		getUserContext().setLocale(locale);
+	}
+	public static Locale getLocale() {
+		if (!isSessionOpen()) {
+			return LocaleUtility.getDefaultLocale();
+		}
+		return getUserContext().getLocale();
+	}
+	public static void openSession() {
+		log.trace("opening session");
+		setUserContext(new UserContext(getAuthenticationScheme())); 
+		getContextDAO().openSession();
+	}
+	public static void closeSession() {
+		log.trace("closing session");
+		clearUserContext(); 
+		getContextDAO().closeSession();
+	}
+	public static void openSessionWithCurrentUser() {
+		getContextDAO().openSession();
+	}
+	public static void closeSessionWithCurrentUser() {
+		getContextDAO().closeSession();
+	}
+	public static void clearSession() {
+		log.trace("clearing session");
+		getContextDAO().clearSession();
+	}
+	public static void flushSession() {
+		log.trace("flushing session");
+		getContextDAO().flushSession();
+	}
+	public static boolean isSessionOpen() {
+		return userContextHolder.get() != null;
+	}
+	public static void refreshEntity(Object obj) {
+		log.trace("refreshing object: {}", obj);
+		getContextDAO().refreshEntity(obj);
+	}
+	public static void evictFromSession(Object obj) {
+		log.trace("clearing session");
+		getContextDAO().evictFromSession(obj);
+	}
+	public static void evictEntity(OpenmrsObject object) {
+		log.debug("Clearing DB cache for entity: {} with id: {}", object.getClass(), object.getId());
+		getContextDAO().evictEntity(object);
+	}
+	public static void evictAllEntities(Class<?> entityClass) {
+		log.debug("Clearing DB cache for entities of type: {}", entityClass);
+		getContextDAO().evictAllEntities(entityClass);
+	}
+	public static void clearEntireCache() {
+		log.debug("Clearing DB cache from all regions");
+		getContextDAO().clearEntireCache();
+	}
+	public static synchronized void startup(Properties props) throws DatabaseUpdateException, InputRequiredException,
+	ModuleMustStartException {
+		getContextDAO().startup(props);
+		checkForDatabaseUpdates(props);
+		OpenmrsUtil.startup(props);
+		openSession();
+		clearSession();
+		checkCoreDataset();
+		getContextDAO().setupSearchIndex();
+		ModuleUtil.startup(props);
+	}
+	public static synchronized void startup(String url, String username, String password, Properties properties)
+			throws DatabaseUpdateException, InputRequiredException, ModuleMustStartException {
+		if (properties == null) {
+			properties = new Properties();
+		}
+		properties.put("connection.url", url);
+		properties.put("connection.username", username);
+		properties.put("connection.password", password);
+		setRuntimeProperties(properties);
+		openSession(); 
+		startup(properties);
+		SchedulerUtil.startup(properties);
+		closeSession();
+	}
+	public static void shutdown() {
+		log.debug("Shutting down the scheduler");
+		try {
+			SchedulerUtil.shutdown();
+		}
+		catch (Exception e) {
+			log.warn("Error while shutting down scheduler service", e);
+		}
+		log.debug("Shutting down the modules");
+		try {
+			ModuleUtil.shutdown();
+		}
+		catch (Exception e) {
+			log.warn("Error while shutting down module system", e);
+		}
+		log.debug("Shutting down the context");
+		try {
+			ContextDAO dao = null;
+			try {
+				dao = getContextDAO();
+			}
+			catch (APIException e) {
+			}
+			if (dao != null) {
+				dao.shutdown();
+			}
+		}
+		catch (Exception e) {
+			log.warn("Error while shutting down context dao", e);
+		}
+	}
+	public static <T> T getService(Class<? extends T> cls) {
+		return getServiceContext().getService(cls);
+	}
+	public static void addAdvisor(Class cls, Advisor advisor) {
+		getServiceContext().addAdvisor(cls, advisor);
+	}
+	public static void addAdvice(Class cls, Advice advice) {
+		getServiceContext().addAdvice(cls, advice);
+	}
+	public static void removeAdvisor(Class cls, Advisor advisor) {
+		getServiceContext().removeAdvisor(cls, advisor);
+	}
+	public static void removeAdvice(Class cls, Advice advice) {
+		getServiceContext().removeAdvice(cls, advice);
+	}
+	public static void checkCoreDataset() {
+		try {
+			Context.addProxyPrivilege(PrivilegeConstants.MANAGE_ROLES);
+			Set<String> currentRoleNames = new HashSet<>();
+			for (Role role : Context.getUserService().getAllRoles()) {
+				currentRoleNames.add(role.getRole().toUpperCase());
+			}
+			Map<String, String> map = OpenmrsUtil.getCoreRoles();
+			for (Map.Entry<String, String> entry : map.entrySet()) {
+				String roleName = entry.getKey();
+				if (!currentRoleNames.contains(roleName.toUpperCase())) {
+					Role role = new Role();
+					role.setRole(roleName);
+					role.setDescription(entry.getValue());
+					Context.getUserService().saveRole(role);
+				}
+			}
+		}
+		catch (Exception e) {
+			log.error("Error while setting core roles for openmrs system", e);
+		}
+		finally {
+			Context.removeProxyPrivilege(PrivilegeConstants.MANAGE_ROLES);
+		}
+		try {
+			Context.addProxyPrivilege(PrivilegeConstants.MANAGE_PRIVILEGES);
+			Set<String> currentPrivilegeNames = new HashSet<>();
+			for (Privilege privilege : Context.getUserService().getAllPrivileges()) {
+				currentPrivilegeNames.add(privilege.getPrivilege().toUpperCase());
+			}
+			Map<String, String> map = OpenmrsUtil.getCorePrivileges();
+			for (Map.Entry<String, String> entry : map.entrySet()) {
+				String privilegeName = entry.getKey();
+				if (!currentPrivilegeNames.contains(privilegeName.toUpperCase())) {
+					Privilege p = new Privilege();
+					p.setPrivilege(privilegeName);
+					p.setDescription(entry.getValue());
+					Context.getUserService().savePrivilege(p);
+				}
+			}
+		}
+		catch (Exception e) {
+			log.error("Error while setting core privileges", e);
+		}
+		finally {
+			Context.removeProxyPrivilege(PrivilegeConstants.MANAGE_PRIVILEGES);
+		}
+		try {
+			Context.addProxyPrivilege(PrivilegeConstants.MANAGE_GLOBAL_PROPERTIES);
+			Context.addProxyPrivilege(PrivilegeConstants.GET_GLOBAL_PROPERTIES);
+			Set<String> currentPropNames = new HashSet<>();
+			Map<String, GlobalProperty> propsMissingDescription = new HashMap<>();
+			Map<String, GlobalProperty> propsMissingDatatype = new HashMap<>();
+			for (GlobalProperty prop : Context.getAdministrationService().getAllGlobalProperties()) {
+				currentPropNames.add(prop.getProperty().toUpperCase());
+				if (prop.getDescription() == null) {
+					propsMissingDescription.put(prop.getProperty().toUpperCase(), prop);
+				}
+				if (prop.getDatatypeClassname() == null) {
+					propsMissingDatatype.put(prop.getProperty().toUpperCase(), prop);
+				}
+			}
+			for (GlobalProperty coreProp : OpenmrsConstants.CORE_GLOBAL_PROPERTIES()) {
+				String corePropName = coreProp.getProperty().toUpperCase();
+				if (!currentPropNames.contains(corePropName)) {
+					Context.getAdministrationService().saveGlobalProperty(coreProp);
+					currentPropNames.add(corePropName); 
+				} else {
+					GlobalProperty propToUpdate = propsMissingDescription.get(corePropName);
+					if (propToUpdate != null) {
+						propToUpdate.setDescription(coreProp.getDescription());
+						Context.getAdministrationService().saveGlobalProperty(propToUpdate);
+					}
+					propToUpdate = propsMissingDatatype.get(corePropName);
+					if (propToUpdate != null && coreProp.getDatatypeClassname() != null) {
+						propToUpdate.setDatatypeClassname(coreProp.getDatatypeClassname());
+						propToUpdate.setDatatypeConfig(coreProp.getDatatypeConfig());
+						propToUpdate.setPreferredHandlerClassname(coreProp.getPreferredHandlerClassname());
+						propToUpdate.setHandlerConfig(coreProp.getHandlerConfig());
+						Context.getAdministrationService().saveGlobalProperty(propToUpdate);
+					}
+				}
+			}
+		}
+		catch (Exception e) {
+			log.error("Error while setting core global properties", e);
+		}
+		finally {
+			Context.removeProxyPrivilege(PrivilegeConstants.MANAGE_GLOBAL_PROPERTIES);
+			Context.removeProxyPrivilege(PrivilegeConstants.GET_GLOBAL_PROPERTIES);
+		}
+		AdministrationService as = Context.getAdministrationService();
+		Boolean disableValidation = Boolean.valueOf(as.getGlobalProperty(OpenmrsConstants.GP_DISABLE_VALIDATION, "false"));
+		ValidateUtil.setDisableValidation(disableValidation);
+		PersonName.setFormat(Context.getAdministrationService().getGlobalProperty(
+				OpenmrsConstants.GLOBAL_PROPERTY_LAYOUT_NAME_FORMAT));
+		Allergen.setOtherNonCodedConceptUuid(Context.getAdministrationService().getGlobalProperty(
+				OpenmrsConstants.GP_ALLERGEN_OTHER_NON_CODED_UUID));
+	}
+	private static void checkForDatabaseUpdates(Properties props) throws DatabaseUpdateException, InputRequiredException {
+		boolean updatesRequired;
+		try {
+			updatesRequired = DatabaseUpdater.updatesRequired();
+		}
+		catch (Exception e) {
+			throw new DatabaseUpdateException("Unable to check if database updates are required", e);
+		}
+		if (updatesRequired) {
+			if (DatabaseUpdater.allowAutoUpdate()) {
+				DatabaseUpdater.executeChangelog();
+			} else {
+				throw new DatabaseUpdateException(
+						"Database updates are required.  Call Context.updateDatabase() before .startup() to continue.");
+			}
+		}
+	}
+	@Deprecated
+	public static void updateDatabase(Map<String, Object> userInput) throws DatabaseUpdateException {
+		throw new UnsupportedOperationException("As of 2.4, this method is not longer implemented");
+	}
+	public static SimpleDateFormat getDateFormat() {
+		return OpenmrsUtil.getDateFormat(getLocale());
+	}
+	public static SimpleDateFormat getTimeFormat() {
+		return OpenmrsUtil.getTimeFormat(getLocale());
+	}
+	public static SimpleDateFormat getDateTimeFormat() {
+		return OpenmrsUtil.getDateTimeFormat(getLocale());
+	}
+	public static boolean isRefreshingContext() {
+		return getServiceContext().isRefreshingContext();
+	}
+	public static <T> List<T> getRegisteredComponents(Class<T> type) {
+		return getServiceContext().getRegisteredComponents(type);
+	}
+	public static <T> T getRegisteredComponent(String beanName, Class<T> type) throws APIException {
+		return getServiceContext().getRegisteredComponent(beanName, type);
+	}
+	public static List<OpenmrsService> getModuleOpenmrsServices(String modulePackage) {
+		return getServiceContext().getModuleOpenmrsServices(modulePackage);
+	}
+	public static VisitService getVisitService() {
+		return getServiceContext().getVisitService();
+	}
+	public static ProviderService getProviderService() {
+		return getServiceContext().getProviderService();
+	}
+	public static DatatypeService getDatatypeService() {
+		return getServiceContext().getDatatypeService();
+	}
+	public static void addConfigProperty(Object key, Object value) {
+		configProperties.put(key, value);
+	}
+	public static void removeConfigProperty(Object key) {
+		configProperties.remove(key);
+	}
+	public static Properties getConfigProperties() {
+		Properties props = new Properties();
+		props.putAll(configProperties);
+		return props;
+	}
+	public static void updateSearchIndex() {
+		getContextDAO().updateSearchIndex();
+	}
+	public static Future<?> updateSearchIndexAsync() {
+		return getContextDAO().updateSearchIndexAsync();
+	}
+	public static void updateSearchIndexForType(Class<?> type) {
+		getContextDAO().updateSearchIndexForType(type);
+	}
+	public static void updateSearchIndexForObject(Object object) {
+		getContextDAO().updateSearchIndexForObject(object);
+	}
+	public static void setUseSystemClassLoader(boolean useSystemClassLoader) {
+		getServiceContext().setUseSystemClassLoader(useSystemClassLoader);
+	}
+	public static boolean isUseSystemClassLoader() {
+		return getServiceContext().isUseSystemClassLoader();
+	}
+	public static Connection getDatabaseConnection() {
+		return getContextDAO().getDatabaseConnection();
+	}
+}
+___________
+
+package org.openmrs.api.context;
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import org.apache.commons.lang3.StringUtils;
+import org.openmrs.Location;
+import org.openmrs.PrivilegeListener;
+import org.openmrs.Role;
+import org.openmrs.User;
+import org.openmrs.UserSessionListener;
+import org.openmrs.UserSessionListener.Event;
+import org.openmrs.UserSessionListener.Status;
+import org.openmrs.api.APIAuthenticationException;
+import org.openmrs.api.LocationService;
+import org.openmrs.util.LocaleUtility;
+import org.openmrs.util.OpenmrsConstants;
+import org.openmrs.util.RoleConstants;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+public class UserContext implements Serializable {
+	private static final long serialVersionUID = -806631231941890648L;
+	private static final Logger log = LoggerFactory.getLogger(UserContext.class);
+	private User user = null;
+	private List<String> proxies = Collections.synchronizedList(new ArrayList<>());
+	private Locale locale = null;
+	private Role authenticatedRole = null;
+	private Role anonymousRole = null;
+	private Integer locationId;
+	private final AuthenticationScheme authenticationScheme;
+	public UserContext(AuthenticationScheme authenticationScheme) {
+		this.authenticationScheme = authenticationScheme;
+	}
+	public Authenticated authenticate(Credentials credentials)
+		throws ContextAuthenticationException {
+		log.debug("Authenticating client '{}' with scheme '{}'", credentials.getClientName(),
+			credentials.getAuthenticationScheme());
+		Authenticated authenticated = null;
+		try {
+			authenticated = authenticationScheme.authenticate(credentials);
+			this.user = authenticated.getUser();
+			notifyUserSessionListener(this.user, Event.LOGIN, Status.SUCCESS);
+		}
+		catch (ContextAuthenticationException e) {
+			User loggingInUser = new User();
+			loggingInUser.setUsername(credentials.getClientName());
+			notifyUserSessionListener(loggingInUser, Event.LOGIN, Status.FAIL);
+			throw e;
+		}
+		setUserLocation(true);
+		setUserLocale(true);
+		log.debug("Authenticated as: {}", this.user);
+		return authenticated;
+	}
+	public void refreshAuthenticatedUser() {
+		log.debug("Refreshing authenticated user");
+		if (user != null) {
+			user = Context.getUserService().getUser(user.getUserId());
+			setUserLocation(false);
+			setUserLocale(false);
+		}
+	}
+	public User becomeUser(String systemId) throws ContextAuthenticationException {
+		if (!Context.getAuthenticatedUser().isSuperUser()) {
+			throw new APIAuthenticationException("You must be a superuser to assume another user's identity");
+		}
+		log.debug("Turning the authenticated user into user with systemId: {}", systemId);
+		User userToBecome = Context.getUserService().getUserByUsername(systemId);
+		if (userToBecome == null) {
+			throw new ContextAuthenticationException("User not found with systemId: " + systemId);
+		}
+		if (userToBecome.getAllRoles() != null) {
+			userToBecome.getAllRoles().size();
+		}
+		if (userToBecome.getUserProperties() != null) {
+			userToBecome.getUserProperties().size();
+		}
+		if (userToBecome.getPrivileges() != null) {
+			userToBecome.getPrivileges().size();
+		}
+		this.user = userToBecome;
+		setUserLocation(false);
+		setUserLocale(false);
+		log.debug("Becoming user: {}", user);
+		return userToBecome;
+	}
+	public User getAuthenticatedUser() {
+		return user;
+	}
+	public boolean isAuthenticated() {
+		return user != null;
+	}
+	public void logout() {
+		log.debug("setting user to null on logout");
+		notifyUserSessionListener(user, Event.LOGOUT, Status.SUCCESS);
+		user = null;
+		locationId = null;
+		locale = null;
+		proxies.clear();
+	}
+	public void addProxyPrivilege(String privilege) {
+		if (privilege == null) {
+			throw new IllegalArgumentException("UserContext.addProxyPrivilege does not accept null privileges");
+		}
+		log.debug("Adding proxy privilege: {}", privilege);
+		proxies.add(privilege);
+	}
+	public void removeProxyPrivilege(String privilege) {
+		log.debug("Removing proxy privilege: {}", privilege);
+		proxies.remove(privilege);
+	}
+	public void setLocale(Locale locale) {
+		this.locale = locale;
+	}
+	public Locale getLocale() {
+		if (locale == null) {
+			return LocaleUtility.getDefaultLocale();
+		}
+		return locale;
+	}
+	public Set<Role> getAllRoles() throws Exception {
+		return getAllRoles(getAuthenticatedUser());
+	}
+	public Set<Role> getAllRoles(User user) throws Exception {
+		Set<Role> roles = new HashSet<>();
+		roles.add(getAnonymousRole());
+		if (getAuthenticatedUser() != null && getAuthenticatedUser().equals(user)) {
+			roles.addAll(user.getAllRoles());
+			roles.add(getAuthenticatedRole());
+		}
+		return roles;
+	}
+	public boolean hasPrivilege(String privilege) {
+		log.debug("Checking '{}' against proxies: {}", privilege, proxies);
+		for (String s : new ArrayList<>(proxies)) {
+			if (s.equals(privilege)) {
+				notifyPrivilegeListeners(getAuthenticatedUser(), privilege, true);
+				return true;
+			}
+		}
+		if (isAuthenticated()
+			&& (getAuthenticatedUser().hasPrivilege(privilege) || getAuthenticatedRole().hasPrivilege(privilege))) {
+			notifyPrivilegeListeners(getAuthenticatedUser(), privilege, true);
+			return true;
+		}
+		if (getAnonymousRole().hasPrivilege(privilege)) {
+			notifyPrivilegeListeners(getAuthenticatedUser(), privilege, true);
+			return true;
+		}
+		notifyPrivilegeListeners(getAuthenticatedUser(), privilege, false);
+		return false;
+	}
+	private Role getAnonymousRole() {
+		if (anonymousRole != null) {
+			return anonymousRole;
+		}
+		anonymousRole = Context.getUserService().getRole(RoleConstants.ANONYMOUS);
+		if (anonymousRole == null) {
+			throw new RuntimeException(
+				"Database out of sync with code: " + RoleConstants.ANONYMOUS + " role does not exist");
+		}
+		return anonymousRole;
+	}
+	private Role getAuthenticatedRole() {
+		if (authenticatedRole != null) {
+			return authenticatedRole;
+		}
+		authenticatedRole = Context.getUserService().getRole(RoleConstants.AUTHENTICATED);
+		if (authenticatedRole == null) {
+			throw new RuntimeException("Database out of sync with code: " + RoleConstants.AUTHENTICATED
+				+ " role does not exist");
+		}
+		return authenticatedRole;
+	}
+	public Integer getLocationId() {
+		return locationId;
+	}
+	public void setLocationId(Integer locationId) {
+		this.locationId = locationId;
+	}
+	public Location getLocation() {
+		if (locationId == null) {
+			return null;
+		}
+		return Context.getLocationService().getLocation(locationId);
+	}
+	public void setLocation(Location location) {
+		if (location != null) {
+			this.locationId = location.getLocationId();
+		}
+	}
+	private void setUserLocation(boolean useDefault) {
+		if (this.user == null) {
+			this.locationId = null;
+			return;
+		}
+		if (this.locationId == null && useDefault) {
+			this.locationId = getDefaultLocationId(this.user);
+		}
+	}
+	private void setUserLocale(boolean useDefault) {
+		if (this.user == null) {
+			this.locale = null;
+			return;
+		}
+		if (user.getUserProperties().containsKey("defaultLocale")) {
+			String localeString = user.getUserProperty("defaultLocale");
+			locale = LocaleUtility.fromSpecification(localeString);
+		}
+		if (locale == null && useDefault) {
+			locale = LocaleUtility.getDefaultLocale();
+		}
+	}
+	protected Integer getDefaultLocationId(User user) {
+		String defaultLocation = user.getUserProperty(OpenmrsConstants.USER_PROPERTY_DEFAULT_LOCATION);
+		if (StringUtils.isNotBlank(defaultLocation)) {
+			LocationService ls = Context.getLocationService();
+			try {
+				int defaultId = Integer.parseInt(defaultLocation);
+				if (this.locationId == null || this.locationId != defaultId) {
+					if (ls.getLocation(defaultId) != null) {
+						return defaultId;
+					}
+				}
+			}
+			catch (NumberFormatException ignored) {
+			}
+			Location possibleLocation = ls.getLocationByUuid(defaultLocation);
+			if (possibleLocation != null && (this.locationId == null || !this.locationId.equals(possibleLocation.getId()))) {
+				return possibleLocation.getId();
+			}
+			log.warn("The default location for user '{}' is set to '{}', which is not a valid location",
+				user.getUsername(), defaultLocation);
+		}
+		return null;
+	}
+	private void notifyPrivilegeListeners(User user, String privilege, boolean hasPrivilege) {
+		for (PrivilegeListener privilegeListener : Context.getRegisteredComponents(PrivilegeListener.class)) {
+			try {
+				privilegeListener.privilegeChecked(user, privilege, hasPrivilege);
+			}
+			catch (Exception e) {
+				log.error("Privilege listener has failed", e);
+			}
+		}
+	}
+	private void notifyUserSessionListener(User user, Event event, Status status) {
+		for (UserSessionListener userSessionListener : Context.getRegisteredComponents(UserSessionListener.class)) {
+			userSessionListener.loggedInOrOut(user, event, status);
+		}
+	}
+}
+
+_____________
+
+
+package org.openmrs.util;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.MissingResourceException;
+import java.util.Set;
+import org.apache.commons.lang3.LocaleUtils;
+import org.openmrs.GlobalProperty;
+import org.openmrs.api.GlobalPropertyListener;
+import org.openmrs.api.context.Context;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.util.StringUtils;
+public class LocaleUtility implements GlobalPropertyListener {
+	private static final Logger log = LoggerFactory.getLogger(LocaleUtility.class);
+	private static volatile Locale defaultLocaleCache = null;
+	private static List<Locale> localesAllowedListCache = null;
+	public static Locale getDefaultLocale() {
+		if (defaultLocaleCache == null) {
+			synchronized (LocaleUtility.class) {
+				if (defaultLocaleCache == null) {
+					if (Context.isSessionOpen()) {
+						try {
+							Context.addProxyPrivilege(PrivilegeConstants.GET_GLOBAL_PROPERTIES);
+							String locale = Context.getAdministrationService().getGlobalProperty(
+								OpenmrsConstants.GLOBAL_PROPERTY_DEFAULT_LOCALE);
+							if (StringUtils.hasLength(locale)) {
+								try {
+									defaultLocaleCache = fromSpecification(locale);
+								} catch (Exception t) {
+									log.warn("Unable to parse default locale global property value: {}", locale, t);
+								}
+							}
+						} catch (Exception e) {
+							log.warn("Unable to get locale global property value. {}", e.getMessage());
+							log.debug("Exception caught while capturing locale global property value.", e);
+						} finally {
+							Context.removeProxyPrivilege(PrivilegeConstants.GET_GLOBAL_PROPERTIES);
+						}
+						if (defaultLocaleCache == null) {
+							defaultLocaleCache = fromSpecification(OpenmrsConstants.GLOBAL_PROPERTY_DEFAULT_LOCALE_DEFAULT_VALUE);
+						}
+					} else {
+						return fromSpecification(OpenmrsConstants.GLOBAL_PROPERTY_DEFAULT_LOCALE_DEFAULT_VALUE);
+					}
+				}
+			}
+		}
+		return defaultLocaleCache;
+	}
+	public static boolean areCompatible(Locale lhs, Locale rhs) {
+		return lhs.equals(rhs) || (("".equals(lhs.getCountry())) || ("".equals(rhs.getCountry()))) && lhs.getLanguage()
+				.equals(rhs.getLanguage());
+	}
+	public static Locale fromSpecification(String localeSpecification) {
+		Locale createdLocale;
+		localeSpecification = localeSpecification.trim();
+		try {
+			createdLocale = LocaleUtils.toLocale(localeSpecification);
+		} catch (IllegalArgumentException e) {
+			if (localeSpecification.matches("[a-zA-Z]{2}[-_][a-zA-Z]{2,}")) {
+				return null;
+			} else {
+				createdLocale = generateLocaleFromLegacyFormat(localeSpecification);
+			}
+		}
+		return createdLocale;
+	}
+	private static Locale generateLocaleFromLegacyFormat(String localeSpecification) {
+		Locale createdLocale = null;
+		String[] localeComponents = localeSpecification.split("_");
+		if (localeComponents.length == 1) {
+			createdLocale = new Locale(localeComponents[0]);
+		} else if (localeComponents.length == 2) {
+			createdLocale = new Locale(localeComponents[0], localeComponents[1]);
+		} else if (localeComponents.length > 2) {
+			String variant = localeSpecification.substring(localeSpecification.indexOf(localeComponents[2]));
+			createdLocale = new Locale(localeComponents[0], localeComponents[1], variant);
+		}
+		return createdLocale;
+	}
+	public static Set<Locale> getLocalesInOrder() {
+		Set<Locale> locales = new LinkedHashSet<>();
+		locales.add(Context.getLocale());
+		locales.add(getDefaultLocale());
+		if (localesAllowedListCache == null) {
+			localesAllowedListCache = Context.getAdministrationService().getAllowedLocales();
+		}
+		if (localesAllowedListCache != null) {
+			locales.addAll(localesAllowedListCache);
+		}
+		locales.add(Locale.ENGLISH);
+		locales.add(fromSpecification(OpenmrsConstants.GLOBAL_PROPERTY_DEFAULT_LOCALE_DEFAULT_VALUE));
+		return locales;
+	}
+	public static void setDefaultLocaleCache(Locale defaultLocaleCache) {
+		LocaleUtility.defaultLocaleCache = defaultLocaleCache;
+	}
+	public static void setLocalesAllowedListCache(List<Locale> localesAllowedListCache) {
+		LocaleUtility.localesAllowedListCache = localesAllowedListCache;
+	}
+	@Override
+	public void globalPropertyChanged(GlobalProperty newValue) {
+		setDefaultLocaleCache(null);
+		setLocalesAllowedListCache(null);
+	}
+	@Override
+	public void globalPropertyDeleted(String propertyName) {
+		setDefaultLocaleCache(null);
+		setLocalesAllowedListCache(null);
+	}
+	@Override
+	public boolean supportsPropertyName(String propertyName) {
+		return propertyName.equals(OpenmrsConstants.GLOBAL_PROPERTY_DEFAULT_LOCALE)
+		        || propertyName.equals(OpenmrsConstants.GLOBAL_PROPERTY_LOCALE_ALLOWED_LIST);
+	}
+	public static boolean isValid(Locale locale) {
+		try {
+			return locale.getISO3Language() != null && locale.getISO3Country() != null;
+		}
+		catch (MissingResourceException e) {
+			return false;
+		}
+	}
+}
