@@ -1,0 +1,52 @@
+SEVERITY = 4
+
+package jadx.plugins.input.smali;
+import jadx.api.plugins.options.impl.BasePluginOptionsBuilder;
+public class SmaliInputOptions extends BasePluginOptionsBuilder {
+	private int apiLevel;
+	private int threads; // use jadx global threads count option
+	@Override
+	public void registerOptions() {
+		intOption(SmaliInputPlugin.PLUGIN_ID + ".api-level")
+				.description("Android API level")
+				.defaultValue(27)
+				.setter(v -> apiLevel = v);
+	}
+	public int getApiLevel() {
+		return apiLevel;
+	}
+	public int getThreads() {
+		return threads;
+	}
+	public void setThreads(int threads) {
+		this.threads = threads;
+	}
+}
+______
+package jadx.plugins.input.smali;
+import jadx.api.plugins.JadxPlugin;
+import jadx.api.plugins.JadxPluginContext;
+import jadx.api.plugins.JadxPluginInfo;
+import jadx.api.plugins.input.data.impl.EmptyCodeLoader;
+import jadx.plugins.input.dex.DexInputPlugin;
+public class SmaliInputPlugin implements JadxPlugin {
+	public static final String PLUGIN_ID = "smali-input";
+	private final SmaliInputOptions options = new SmaliInputOptions();
+	@Override
+	public JadxPluginInfo getPluginInfo() {
+		return new JadxPluginInfo(PLUGIN_ID, "Smali Input", "Load .smali files");
+	}
+	@Override
+	public void init(JadxPluginContext context) {
+		context.registerOptions(options);
+		options.setThreads(context.getArgs().getThreadsCount());
+		DexInputPlugin dexInput = context.plugins().getInstance(DexInputPlugin.class);
+		context.addCodeInput(input -> {
+			SmaliConvert convert = new SmaliConvert();
+			if (!convert.execute(input, options)) {
+				return EmptyCodeLoader.INSTANCE;
+			}
+			return dexInput.loadDexData(convert.getDexData());
+		});
+	}
+}

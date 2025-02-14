@@ -1,0 +1,395 @@
+SEVERITY = 4
+
+package jadx.plugins.input.java.data.code;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
+import org.jetbrains.annotations.Nullable;
+import jadx.api.plugins.input.insns.Opcode;
+import jadx.core.utils.Utils;
+import jadx.plugins.input.java.data.DataReader;
+import jadx.plugins.input.java.data.JavaClassData;
+import jadx.plugins.input.java.data.attributes.stack.StackFrame;
+import jadx.plugins.input.java.data.attributes.stack.StackValueType;
+import jadx.plugins.input.java.data.attributes.types.StackMapTableAttr;
+@SuppressWarnings("UnusedReturnValue")
+public class CodeDecodeState {
+	private final JavaClassData clsData;
+	private final DataReader reader;
+	private final int maxStack;
+	private final Set<Integer> excHandlers;
+	private final StackMapTableAttr stackMapTable;
+	private final Map<Integer, StackState> jumpStack = new HashMap<>(); 
+	private JavaInsnData insn;
+	private StackState stack;
+	private boolean excHandler;
+	public CodeDecodeState(JavaClassData clsData, DataReader reader, int maxStack,
+			Set<Integer> excHandlers, @Nullable StackMapTableAttr stackMapTable) {
+		this.clsData = clsData;
+		this.reader = reader;
+		this.maxStack = maxStack;
+		this.excHandlers = excHandlers;
+		this.stack = new StackState(maxStack);
+		this.stackMapTable = Utils.getOrElse(stackMapTable, StackMapTableAttr.EMPTY);
+	}
+	public void onInsn(int offset) {
+		StackState newStack = loadStack(offset);
+		if (newStack != null) {
+			this.stack = newStack;
+		}
+		if (excHandlers.contains(offset)) {
+			clear();
+			stack.push(StackValueType.NARROW); 
+			excHandler = true;
+		} else {
+			excHandler = false;
+		}
+	}
+	private @Nullable StackState loadStack(int offset) {
+		StackState stackState = jumpStack.get(offset);
+		if (stackState != null) {
+			return stackState.copy();
+		}
+		StackFrame frame = stackMapTable.getFor(offset);
+		if (frame != null) {
+			return new StackState(maxStack).fillFromFrame(frame);
+		}
+		return null;
+	}
+	public void registerJump(int jumpOffset) {
+		Integer key = jumpOffset;
+		if (!jumpStack.containsKey(key)) {
+			jumpStack.put(key, stack.copy());
+		}
+	}
+	public void decoded() {
+		if (excHandler && insn.getOpcode() == Opcode.MOVE) {
+			insn.setOpcode(Opcode.MOVE_EXCEPTION);
+			insn.setRegsCount(1);
+		}
+	}
+	public JavaInsnData insn() {
+		return insn;
+	}
+	public void setInsn(JavaInsnData insn) {
+		this.insn = insn;
+	}
+	public DataReader reader() {
+		return reader;
+	}
+	public JavaClassData clsData() {
+		return clsData;
+	}
+	public CodeDecodeState local(int arg, int local) {
+		insn.setArgReg(arg, localToReg(local));
+		return this;
+	}
+	public CodeDecodeState pop(int arg) {
+		insn.setArgReg(arg, stack.pop());
+		return this;
+	}
+	public CodeDecodeState peek(int arg) {
+		insn.setArgReg(arg, stack.peek());
+		return this;
+	}
+	public StackValueType peekType(int at) {
+		return stack.peekTypeAt(at);
+	}
+	public CodeDecodeState peekFrom(int pos, int arg) {
+		insn.setArgReg(arg, stack.peekAt(pos));
+		return this;
+	}
+	public CodeDecodeState push(int arg) {
+		insn.setArgReg(arg, stack.push(StackValueType.NARROW));
+		return this;
+	}
+	public CodeDecodeState push(int arg, StackValueType type) {
+		insn.setArgReg(arg, stack.push(type));
+		return this;
+	}
+	public CodeDecodeState pushWide(int arg) {
+		insn.setArgReg(arg, stack.push(StackValueType.WIDE));
+		return this;
+	}
+	public int insert(int pos, StackValueType type) {
+		return stack.insert(pos, type);
+	}
+	public void discard() {
+		stack.pop();
+	}
+	public void discardWord() {
+		StackValueType type = stack.peekTypeAt(0);
+		stack.pop();
+		if (type == StackValueType.NARROW) {
+			stack.pop();
+		}
+	}
+	public CodeDecodeState clear() {
+		stack.clear();
+		return this;
+	}
+	public int push(String type) {
+		return stack.push(getSVType(type));
+	}
+	public void jump(int offset) {
+		int jumpOffset = insn.getOffset() + offset;
+		insn.setTarget(jumpOffset);
+		registerJump(jumpOffset);
+	}
+	public CodeDecodeState idx(int idx) {
+		insn.setIndex(idx);
+		return this;
+	}
+	public CodeDecodeState lit(long lit) {
+		insn.setLiteral(lit);
+		return this;
+	}
+	private int localToReg(int local) {
+		return maxStack + local;
+	}
+	public StackValueType fieldType() {
+		String type = insn.constPoolReader().getFieldType(insn().getIndex());
+		return getSVType(type);
+	}
+	public StackValueType getSVType(String type) {
+		if (type.equals("J") || type.equals("D")) {
+			return StackValueType.WIDE;
+		}
+		return StackValueType.NARROW;
+	}
+	public int u1() {
+		return reader.readU1();
+	}
+	public int u2() {
+		return reader.readU2();
+	}
+	public int s1() {
+		return reader.readS1();
+	}
+	public int s2() {
+		return reader.readS2();
+	}
+}
+____
+package jadx.plugins.input.java.data.code;
+import org.jetbrains.annotations.Nullable;
+import jadx.api.plugins.input.data.ICallSite;
+import jadx.api.plugins.input.data.IFieldRef;
+import jadx.api.plugins.input.data.IMethodHandle;
+import jadx.api.plugins.input.data.IMethodProto;
+import jadx.api.plugins.input.data.IMethodRef;
+import jadx.api.plugins.input.insns.InsnData;
+import jadx.api.plugins.input.insns.InsnIndexType;
+import jadx.api.plugins.input.insns.Opcode;
+import jadx.api.plugins.input.insns.custom.ICustomPayload;
+import jadx.plugins.input.java.data.ConstPoolReader;
+import jadx.plugins.input.java.data.DataReader;
+import jadx.plugins.input.java.data.code.decoders.IJavaInsnDecoder;
+public class JavaInsnData implements InsnData {
+	private final CodeDecodeState state;
+	private JavaInsnInfo insnInfo;
+	private Opcode opcode;
+	private boolean decoded;
+	private int opcodeUnit;
+	private int payloadSize;
+	private int insnStart;
+	private int offset;
+	private int regsCount;
+	private int[] argsReg = new int[16];
+	private int resultReg;
+	private long literal;
+	private int target;
+	private int index;
+	@Nullable
+	private ICustomPayload payload;
+	public JavaInsnData(CodeDecodeState state) {
+		this.state = state;
+	}
+	@Override
+	public void decode() {
+		IJavaInsnDecoder decoder = insnInfo.getDecoder();
+		if (decoder != null) {
+			decoder.decode(state);
+			state.decoded();
+		}
+		decoded = true;
+	}
+	public void skip() {
+		IJavaInsnDecoder decoder = insnInfo.getDecoder();
+		if (decoder != null) {
+			decoder.skip(state);
+		}
+	}
+	@Override
+	public int getOffset() {
+		return offset;
+	}
+	@Override
+	public int getFileOffset() {
+		return insnStart;
+	}
+	@Override
+	public Opcode getOpcode() {
+		return opcode;
+	}
+	public void setOpcode(Opcode opcode) {
+		this.opcode = opcode;
+	}
+	@Override
+	public String getOpcodeMnemonic() {
+		return insnInfo.getName();
+	}
+	@Override
+	public byte[] getByteCode() {
+		DataReader reader = state.reader();
+		int startOffset = reader.getOffset();
+		try {
+			reader.absPos(insnStart);
+			return reader.readBytes(1 + payloadSize);
+		} finally {
+			reader.absPos(startOffset);
+		}
+	}
+	@Override
+	public InsnIndexType getIndexType() {
+		return insnInfo.getIndexType();
+	}
+	@Override
+	public int getRawOpcodeUnit() {
+		return opcodeUnit;
+	}
+	@Override
+	public int getRegsCount() {
+		return regsCount;
+	}
+	@Override
+	public int getReg(int argNum) {
+		return argsReg[argNum];
+	}
+	@Override
+	public int getResultReg() {
+		return resultReg;
+	}
+	public void setResultReg(int resultReg) {
+		this.resultReg = resultReg;
+	}
+	@Override
+	public long getLiteral() {
+		return literal;
+	}
+	@Override
+	public int getTarget() {
+		return target;
+	}
+	@Override
+	public int getIndex() {
+		return index;
+	}
+	public int getPayloadSize() {
+		return payloadSize;
+	}
+	@Override
+	public String getIndexAsString() {
+		return constPoolReader().getUtf8(index);
+	}
+	@Override
+	public String getIndexAsType() {
+		if (insnInfo.getOpcode() == 0xbc) { 
+			return ArrayType.byValue(index);
+		}
+		return constPoolReader().getClass(index);
+	}
+	@Override
+	public IFieldRef getIndexAsField() {
+		return constPoolReader().getFieldRef(index);
+	}
+	@Override
+	public IMethodRef getIndexAsMethod() {
+		return constPoolReader().getMethodRef(index);
+	}
+	@Override
+	public ICallSite getIndexAsCallSite() {
+		return constPoolReader().getCallSite(index);
+	}
+	@Override
+	public IMethodProto getIndexAsProto(int protoIndex) {
+		return null;
+	}
+	@Override
+	public IMethodHandle getIndexAsMethodHandle() {
+		return null;
+	}
+	@Override
+	public @Nullable ICustomPayload getPayload() {
+		return payload;
+	}
+	public void setInsnInfo(JavaInsnInfo insnInfo) {
+		this.insnInfo = insnInfo;
+	}
+	public boolean isDecoded() {
+		return decoded;
+	}
+	public void setDecoded(boolean decoded) {
+		this.decoded = decoded;
+	}
+	public void setOpcodeUnit(int opcodeUnit) {
+		this.opcodeUnit = opcodeUnit;
+	}
+	public void setPayloadSize(int payloadSize) {
+		this.payloadSize = payloadSize;
+	}
+	public void setInsnStart(int insnStart) {
+		this.insnStart = insnStart;
+	}
+	public void setOffset(int offset) {
+		this.offset = offset;
+	}
+	public void setArgReg(int arg, int reg) {
+		this.argsReg[arg] = reg;
+	}
+	public void setRegsCount(int regsCount) {
+		this.regsCount = regsCount;
+		if (argsReg.length < regsCount) {
+			argsReg = new int[regsCount];
+		}
+	}
+	public int[] getRegsArray() {
+		return argsReg;
+	}
+	public void setLiteral(long literal) {
+		this.literal = literal;
+	}
+	public void setTarget(int target) {
+		this.target = target;
+	}
+	public void setIndex(int index) {
+		this.index = index;
+	}
+	public void setPayload(ICustomPayload payload) {
+		this.payload = payload;
+	}
+	public ConstPoolReader constPoolReader() {
+		return state.clsData().getConstPoolReader();
+	}
+	@Override
+	public String toString() {
+		StringBuilder sb = new StringBuilder();
+		sb.append(String.format("0x%04X", offset));
+		sb.append(": ").append(getOpcode());
+		if (insnInfo == null) {
+			sb.append(String.format("(0x%04X)", opcodeUnit));
+		} else {
+			int regsCount = getRegsCount();
+			if (isDecoded()) {
+				sb.append(' ');
+				for (int i = 0; i < regsCount; i++) {
+					if (i != 0) {
+						sb.append(", ");
+					}
+					sb.append("r").append(argsReg[i]);
+				}
+			}
+		}
+		return sb.toString();
+	}
+}
