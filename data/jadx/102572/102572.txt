@@ -1,0 +1,116 @@
+SEVERITY = 4
+
+package jadx.plugins.input.dex.smali;
+import jadx.api.plugins.input.data.AccessFlags;
+import jadx.api.plugins.input.data.ICodeReader;
+import jadx.plugins.input.dex.sections.DexMethodData;
+import jadx.plugins.input.dex.sections.DexMethodRef;
+import static jadx.api.plugins.input.data.AccessFlagsScope.METHOD;
+public class SmaliPrinter {
+	public static String printMethod(DexMethodData mth) {
+		SmaliCodeWriter codeWriter = new SmaliCodeWriter();
+		codeWriter.startLine(".method ");
+		codeWriter.add(AccessFlags.format(mth.getAccessFlags(), METHOD));
+		DexMethodRef methodRef = mth.getMethodRef();
+		methodRef.load();
+		codeWriter.add(methodRef.getName());
+		codeWriter.add('(').addArgs(methodRef.getArgTypes()).add(')');
+		codeWriter.add(methodRef.getReturnType());
+		codeWriter.incIndent();
+		ICodeReader codeReader = mth.getCodeReader();
+		if (codeReader != null) {
+			codeWriter.startLine(".registers ").add(codeReader.getRegistersCount());
+			SmaliInsnFormat insnFormat = SmaliInsnFormat.getInstance();
+			InsnFormatterInfo formatterInfo = new InsnFormatterInfo(codeWriter, mth);
+			codeReader.visitInstructions(insn -> {
+				codeWriter.startLine();
+				formatterInfo.setInsn(insn);
+				insnFormat.format(formatterInfo);
+			});
+			codeWriter.decIndent();
+		}
+		codeWriter.startLine(".end method");
+		return codeWriter.getCode();
+	}
+}
+_____
+package jadx.plugins.input.dex.sections;
+import java.util.ArrayList;
+import java.util.List;
+import org.jetbrains.annotations.Nullable;
+import jadx.api.plugins.input.data.ICodeReader;
+import jadx.api.plugins.input.data.IMethodData;
+import jadx.api.plugins.input.data.annotations.IAnnotation;
+import jadx.api.plugins.input.data.attributes.IJadxAttribute;
+import jadx.api.plugins.input.data.attributes.types.AnnotationMethodParamsAttr;
+import jadx.api.plugins.utils.Utils;
+import jadx.plugins.input.dex.sections.annotations.AnnotationsParser;
+import jadx.plugins.input.dex.smali.SmaliPrinter;
+public class DexMethodData implements IMethodData {
+	@Nullable
+	private final AnnotationsParser annotationsParser;
+	private DexMethodRef methodRef;
+	private int accessFlags;
+	private int annotationsOffset;
+	private int paramAnnotationsOffset;
+	@Nullable
+	private DexCodeReader codeReader;
+	public DexMethodData(@Nullable AnnotationsParser annotationsParser) {
+		this.annotationsParser = annotationsParser;
+	}
+	@Override
+	public DexMethodRef getMethodRef() {
+		return methodRef;
+	}
+	public void setMethodRef(DexMethodRef methodRef) {
+		this.methodRef = methodRef;
+	}
+	@Override
+	public int getAccessFlags() {
+		return accessFlags;
+	}
+	public void setAccessFlags(int accessFlags) {
+		this.accessFlags = accessFlags;
+	}
+	@Nullable
+	@Override
+	public ICodeReader getCodeReader() {
+		return codeReader;
+	}
+	public void setCodeReader(@Nullable DexCodeReader codeReader) {
+		this.codeReader = codeReader;
+	}
+	@Override
+	public String disassembleMethod() {
+		return SmaliPrinter.printMethod(this);
+	}
+	public void setAnnotationsOffset(int annotationsOffset) {
+		this.annotationsOffset = annotationsOffset;
+	}
+	public void setParamAnnotationsOffset(int paramAnnotationsOffset) {
+		this.paramAnnotationsOffset = paramAnnotationsOffset;
+	}
+	private List<IAnnotation> getAnnotations() {
+		return getAnnotationsParser().readAnnotationList(annotationsOffset);
+	}
+	private List<List<IAnnotation>> getParamsAnnotations() {
+		return getAnnotationsParser().readAnnotationRefList(paramAnnotationsOffset);
+	}
+	@Override
+	public List<IJadxAttribute> getAttributes() {
+		List<IJadxAttribute> list = new ArrayList<>();
+		DexAnnotationsConvert.forMethod(list, getAnnotations());
+		Utils.addToList(list, AnnotationMethodParamsAttr.pack(getParamsAnnotations()));
+		return list;
+	}
+	private AnnotationsParser getAnnotationsParser() {
+		if (annotationsParser == null) {
+			throw new NullPointerException("Annotation parser not initialized");
+		}
+		return annotationsParser;
+	}
+	@Override
+	public String toString() {
+		return getMethodRef().toString();
+	}
+}
