@@ -1,0 +1,722 @@
+SEVERITY = 4
+
+package jadx.core.dex.instructions.args;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import jadx.api.metadata.annotations.VarNode;
+public class CodeVar {
+	private String name;
+	private ArgType type; 
+	private List<SSAVar> ssaVars = Collections.emptyList();
+	private boolean isFinal;
+	private boolean isThis;
+	private boolean isDeclared;
+	private VarNode cachedVarNode; 
+	public static CodeVar fromMthArg(RegisterArg mthArg, boolean linkRegister) {
+		CodeVar var = new CodeVar();
+		var.setType(mthArg.getInitType());
+		var.setName(mthArg.getName());
+		var.setThis(mthArg.isThis());
+		var.setDeclared(true);
+		var.setThis(mthArg.isThis());
+		if (linkRegister) {
+			var.setSsaVars(Collections.singletonList(new SSAVar(mthArg.getRegNum(), 0, mthArg)));
+		}
+		return var;
+	}
+	public String getName() {
+		return name;
+	}
+	public void setName(String name) {
+		this.name = name;
+	}
+	public ArgType getType() {
+		return type;
+	}
+	public void setType(ArgType type) {
+		this.type = type;
+	}
+	public List<SSAVar> getSsaVars() {
+		return ssaVars;
+	}
+	public void addSsaVar(SSAVar ssaVar) {
+		if (ssaVars.isEmpty()) {
+			ssaVars = new ArrayList<>(3);
+		}
+		if (!ssaVars.contains(ssaVar)) {
+			ssaVars.add(ssaVar);
+		}
+	}
+	public void setSsaVars(List<SSAVar> ssaVars) {
+		this.ssaVars = ssaVars;
+	}
+	public SSAVar getAnySsaVar() {
+		if (ssaVars.isEmpty()) {
+			throw new IllegalStateException("CodeVar without SSA variables attached: " + this);
+		}
+		return ssaVars.get(0);
+	}
+	public boolean isFinal() {
+		return isFinal;
+	}
+	public void setFinal(boolean aFinal) {
+		isFinal = aFinal;
+	}
+	public boolean isThis() {
+		return isThis;
+	}
+	public void setThis(boolean aThis) {
+		isThis = aThis;
+	}
+	public boolean isDeclared() {
+		return isDeclared;
+	}
+	public void setDeclared(boolean declared) {
+		isDeclared = declared;
+	}
+	public VarNode getCachedVarNode() {
+		return cachedVarNode;
+	}
+	public void setCachedVarNode(VarNode varNode) {
+		this.cachedVarNode = varNode;
+	}
+	public void mergeFlagsFrom(CodeVar other) {
+		if (other.isDeclared()) {
+			setDeclared(true);
+		}
+		if (other.isThis()) {
+			setThis(true);
+		}
+		if (other.isFinal()) {
+			setFinal(true);
+		}
+	}
+	@Override
+	public String toString() {
+		return (isFinal ? "final " : "") + type + ' ' + name;
+	}
+}
+______
+package jadx.core.dex.instructions;
+import java.util.ArrayList;
+import java.util.List;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import jadx.core.dex.attributes.AFlag;
+import jadx.core.dex.instructions.args.ArgType;
+import jadx.core.dex.instructions.args.InsnArg;
+import jadx.core.dex.instructions.args.RegisterArg;
+import jadx.core.dex.instructions.args.SSAVar;
+import jadx.core.dex.nodes.BlockNode;
+import jadx.core.dex.nodes.InsnNode;
+import jadx.core.utils.InsnRemover;
+import jadx.core.utils.exceptions.JadxRuntimeException;
+public final class PhiInsn extends InsnNode {
+	private final List<BlockNode> blockBinds;
+	public PhiInsn(int regNum, int predecessors) {
+		this(predecessors);
+		setResult(InsnArg.reg(regNum, ArgType.UNKNOWN));
+		add(AFlag.DONT_INLINE);
+		add(AFlag.DONT_GENERATE);
+	}
+	private PhiInsn(int argsCount) {
+		super(InsnType.PHI, argsCount);
+		this.blockBinds = new ArrayList<>(argsCount);
+	}
+	public RegisterArg bindArg(BlockNode pred) {
+		RegisterArg arg = InsnArg.reg(getResult().getRegNum(), getResult().getInitType());
+		bindArg(arg, pred);
+		return arg;
+	}
+	public void bindArg(RegisterArg arg, BlockNode pred) {
+		if (blockBinds.contains(pred)) {
+			throw new JadxRuntimeException("Duplicate predecessors in PHI insn: " + pred + ", " + this);
+		}
+		if (pred == null) {
+			throw new JadxRuntimeException("Null bind block in PHI insn: " + this);
+		}
+		super.addArg(arg);
+		blockBinds.add(pred);
+	}
+	@Nullable
+	public BlockNode getBlockByArg(RegisterArg arg) {
+		int index = getArgIndex(arg);
+		if (index == -1) {
+			return null;
+		}
+		return blockBinds.get(index);
+	}
+	public BlockNode getBlockByArgIndex(int argIndex) {
+		return blockBinds.get(argIndex);
+	}
+	@Override
+	@NotNull
+	public RegisterArg getArg(int n) {
+		return (RegisterArg) super.getArg(n);
+	}
+	@Override
+	public boolean removeArg(InsnArg arg) {
+		int index = getArgIndex(arg);
+		if (index == -1) {
+			return false;
+		}
+		removeArg(index);
+		return true;
+	}
+	@Override
+	public RegisterArg removeArg(int index) {
+		RegisterArg reg = (RegisterArg) super.removeArg(index);
+		blockBinds.remove(index);
+		reg.getSVar().updateUsedInPhiList();
+		return reg;
+	}
+	@Nullable
+	public RegisterArg getArgBySsaVar(SSAVar ssaVar) {
+		if (getArgsCount() == 0) {
+			return null;
+		}
+		for (InsnArg insnArg : getArguments()) {
+			RegisterArg reg = (RegisterArg) insnArg;
+			if (reg.getSVar() == ssaVar) {
+				return reg;
+			}
+		}
+		return null;
+	}
+	@Override
+	public boolean replaceArg(InsnArg from, InsnArg to) {
+		if (!(from instanceof RegisterArg) || !(to instanceof RegisterArg)) {
+			return false;
+		}
+		int argIndex = getArgIndex(from);
+		if (argIndex == -1) {
+			return false;
+		}
+		((RegisterArg) to).getSVar().addUsedInPhi(this);
+		super.setArg(argIndex, to);
+		InsnRemover.unbindArgUsage(null, from);
+		((RegisterArg) from).getSVar().updateUsedInPhiList();
+		return true;
+	}
+	@Override
+	public void addArg(InsnArg arg) {
+		throw new JadxRuntimeException("Direct addArg is forbidden for PHI insn, bindArg must be used");
+	}
+	@Override
+	public void setArg(int n, InsnArg arg) {
+		throw new JadxRuntimeException("Direct setArg is forbidden for PHI insn, bindArg must be used");
+	}
+	@Override
+	public InsnNode copy() {
+		return copyCommonParams(new PhiInsn(getArgsCount()));
+	}
+	@Override
+	public String toString() {
+		return baseString() + " binds: " + blockBinds + attributesString();
+	}
+}
+______
+package jadx.core.dex.instructions.args;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import jadx.core.Consts;
+import jadx.core.dex.attributes.AFlag;
+import jadx.core.dex.attributes.AType;
+import jadx.core.dex.attributes.nodes.RegDebugInfoAttr;
+import jadx.core.dex.instructions.InsnType;
+import jadx.core.dex.instructions.PhiInsn;
+import jadx.core.dex.nodes.InsnNode;
+import jadx.core.dex.nodes.MethodNode;
+import jadx.core.dex.visitors.typeinference.TypeInfo;
+import jadx.core.utils.StringUtils;
+import jadx.core.utils.exceptions.JadxRuntimeException;
+public class SSAVar implements Comparable<SSAVar> {
+	private static final Logger LOG = LoggerFactory.getLogger(SSAVar.class);
+	private static final Comparator<SSAVar> SSA_VAR_COMPARATOR =
+			Comparator.comparingInt(SSAVar::getRegNum).thenComparingInt(SSAVar::getVersion);
+	private final int regNum;
+	private final int version;
+	private RegisterArg assign;
+	private final List<RegisterArg> useList = new ArrayList<>(2);
+	private List<PhiInsn> usedInPhi = null;
+	private final TypeInfo typeInfo = new TypeInfo();
+	@Nullable("Set in InitCodeVariables pass")
+	private CodeVar codeVar;
+	public SSAVar(int regNum, int v, @NotNull RegisterArg assign) {
+		this.regNum = regNum;
+		this.version = v;
+		this.assign = assign;
+		assign.setSVar(this);
+	}
+	public int getRegNum() {
+		return regNum;
+	}
+	public int getVersion() {
+		return version;
+	}
+	@NotNull
+	public RegisterArg getAssign() {
+		return assign;
+	}
+	@Nullable
+	public InsnNode getAssignInsn() {
+		return assign.getParentInsn();
+	}
+	public void setAssign(@NotNull RegisterArg assign) {
+		RegisterArg oldAssign = this.assign;
+		if (oldAssign == null) {
+			this.assign = assign;
+		} else if (oldAssign != assign) {
+			oldAssign.resetSSAVar();
+			this.assign = assign;
+		}
+	}
+	public List<RegisterArg> getUseList() {
+		return useList;
+	}
+	public int getUseCount() {
+		return useList.size();
+	}
+	@Nullable
+	public ArgType getImmutableType() {
+		if (isTypeImmutable()) {
+			return assign.getInitType();
+		}
+		return null;
+	}
+	public boolean isTypeImmutable() {
+		return assign.contains(AFlag.IMMUTABLE_TYPE);
+	}
+	public void markAsImmutable(ArgType type) {
+		assign.add(AFlag.IMMUTABLE_TYPE);
+		ArgType initType = assign.getInitType();
+		if (!initType.equals(type)) {
+			assign.forceSetInitType(type);
+			if (Consts.DEBUG_TYPE_INFERENCE) {
+				LOG.debug("Update immutable type at var {} assign with type: {} previous type: {}", this.toShortString(), type, initType);
+			}
+		}
+	}
+	public void setType(ArgType type) {
+		ArgType imType = getImmutableType();
+		if (imType != null && !imType.equals(type)) {
+			throw new JadxRuntimeException("Can't change immutable type " + imType + " to " + type + " for " + this);
+		}
+		updateType(type);
+	}
+	public void forceSetType(ArgType type) {
+		updateType(type);
+	}
+	private void updateType(ArgType type) {
+		typeInfo.setType(type);
+		if (codeVar != null) {
+			codeVar.setType(type);
+		}
+	}
+	public void use(RegisterArg arg) {
+		if (arg.getSVar() != null) {
+			arg.getSVar().removeUse(arg);
+		}
+		arg.setSVar(this);
+		useList.add(arg);
+	}
+	public void removeUse(RegisterArg arg) {
+		useList.removeIf(registerArg -> registerArg == arg);
+	}
+	public void addUsedInPhi(PhiInsn phiInsn) {
+		if (usedInPhi == null) {
+			usedInPhi = new ArrayList<>(1);
+		}
+		usedInPhi.add(phiInsn);
+	}
+	public void removeUsedInPhi(PhiInsn phiInsn) {
+		if (usedInPhi != null) {
+			usedInPhi.removeIf(insn -> insn == phiInsn);
+			if (usedInPhi.isEmpty()) {
+				usedInPhi = null;
+			}
+		}
+	}
+	public void updateUsedInPhiList() {
+		this.usedInPhi = null;
+		for (RegisterArg reg : useList) {
+			InsnNode parentInsn = reg.getParentInsn();
+			if (parentInsn != null && parentInsn.getType() == InsnType.PHI) {
+				addUsedInPhi((PhiInsn) parentInsn);
+			}
+		}
+	}
+	@Nullable
+	public PhiInsn getOnlyOneUseInPhi() {
+		if (usedInPhi != null && usedInPhi.size() == 1) {
+			return usedInPhi.get(0);
+		}
+		return null;
+	}
+	public List<PhiInsn> getUsedInPhi() {
+		if (usedInPhi == null) {
+			return Collections.emptyList();
+		}
+		return usedInPhi;
+	}
+	public List<PhiInsn> getPhiList() {
+		InsnNode assignInsn = getAssign().getParentInsn();
+		if (assignInsn != null && assignInsn.getType() == InsnType.PHI) {
+			PhiInsn assignPhi = (PhiInsn) assignInsn;
+			if (usedInPhi == null) {
+				return Collections.singletonList(assignPhi);
+			}
+			List<PhiInsn> list = new ArrayList<>(1 + usedInPhi.size());
+			list.add(assignPhi);
+			list.addAll(usedInPhi);
+			return list;
+		}
+		if (usedInPhi == null) {
+			return Collections.emptyList();
+		}
+		return usedInPhi;
+	}
+	public boolean isAssignInPhi() {
+		InsnNode assignInsn = getAssignInsn();
+		return assignInsn != null && assignInsn.getType() == InsnType.PHI;
+	}
+	public boolean isUsedInPhi() {
+		return usedInPhi != null && !usedInPhi.isEmpty();
+	}
+	public void setName(String name) {
+		if (name != null) {
+			if (codeVar == null) {
+				throw new JadxRuntimeException("CodeVar not initialized for name set in SSAVar: " + this);
+			}
+			codeVar.setName(name);
+		}
+	}
+	public String getName() {
+		if (codeVar == null) {
+			return null;
+		}
+		return codeVar.getName();
+	}
+	public TypeInfo getTypeInfo() {
+		return typeInfo;
+	}
+	@NotNull
+	public CodeVar getCodeVar() {
+		if (codeVar == null) {
+			throw new JadxRuntimeException("Code variable not set in " + this);
+		}
+		return codeVar;
+	}
+	public void setCodeVar(@NotNull CodeVar codeVar) {
+		this.codeVar = codeVar;
+		codeVar.addSsaVar(this);
+		ArgType imType = getImmutableType();
+		if (imType != null) {
+			codeVar.setType(imType);
+		}
+	}
+	public void resetTypeAndCodeVar() {
+		if (!isTypeImmutable()) {
+			updateType(ArgType.UNKNOWN);
+		}
+		this.typeInfo.getBounds().clear();
+		this.codeVar = null;
+	}
+	public boolean isCodeVarSet() {
+		return codeVar != null;
+	}
+	public String getDetailedVarInfo(MethodNode mth) {
+		Set<ArgType> types = new HashSet<>();
+		Set<String> names = Collections.emptySet();
+		List<RegisterArg> useArgs = new ArrayList<>(1 + useList.size());
+		useArgs.add(assign);
+		useArgs.addAll(useList);
+		if (mth.contains(AType.LOCAL_VARS_DEBUG_INFO)) {
+			names = new HashSet<>();
+			for (RegisterArg arg : useArgs) {
+				RegDebugInfoAttr debugInfoAttr = arg.get(AType.REG_DEBUG_INFO);
+				if (debugInfoAttr != null) {
+					names.add(debugInfoAttr.getName());
+					types.add(debugInfoAttr.getRegType());
+				}
+			}
+		}
+		for (RegisterArg arg : useArgs) {
+			ArgType initType = arg.getInitType();
+			if (initType.isTypeKnown()) {
+				types.add(initType);
+			}
+			ArgType type = arg.getType();
+			if (type.isTypeKnown()) {
+				types.add(type);
+			}
+		}
+		StringBuilder sb = new StringBuilder();
+		sb.append('r').append(regNum).append('v').append(version);
+		if (!names.isEmpty()) {
+			String orderedNames = names.stream()
+					.sorted()
+					.collect(Collectors.joining(", ", "[", "]"));
+			sb.append(", names: ").append(orderedNames);
+		}
+		if (!types.isEmpty()) {
+			String orderedTypes = types.stream()
+					.map(String::valueOf)
+					.sorted()
+					.collect(Collectors.joining(", ", "[", "]"));
+			sb.append(", types: ").append(orderedTypes);
+		}
+		return sb.toString();
+	}
+	@Override
+	public boolean equals(Object o) {
+		if (this == o) {
+			return true;
+		}
+		if (!(o instanceof SSAVar)) {
+			return false;
+		}
+		SSAVar ssaVar = (SSAVar) o;
+		return regNum == ssaVar.regNum && version == ssaVar.version;
+	}
+	@Override
+	public int hashCode() {
+		return 31 * regNum + version;
+	}
+	@Override
+	public int compareTo(@NotNull SSAVar o) {
+		return SSA_VAR_COMPARATOR.compare(this, o);
+	}
+	public String toShortString() {
+		return "r" + regNum + 'v' + version;
+	}
+	@Override
+	public String toString() {
+		return toShortString()
+				+ (StringUtils.notEmpty(getName()) ? " '" + getName() + "' " : "")
+				+ ' ' + typeInfo.getType();
+	}
+}
+______
+package jadx.core.dex.instructions.args;
+import java.util.Objects;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import jadx.core.dex.attributes.AFlag;
+import jadx.core.dex.nodes.InsnNode;
+import jadx.core.dex.nodes.MethodNode;
+import jadx.core.utils.exceptions.JadxRuntimeException;
+public class RegisterArg extends InsnArg implements Named {
+	public static final String THIS_ARG_NAME = "this";
+	public static final String SUPER_ARG_NAME = "super";
+	protected final int regNum;
+	private SSAVar sVar;
+	public RegisterArg(int rn, ArgType type) {
+		this.type = type; 
+		this.regNum = rn;
+	}
+	public int getRegNum() {
+		return regNum;
+	}
+	@Override
+	public boolean isRegister() {
+		return true;
+	}
+	public ArgType getInitType() {
+		return type;
+	}
+	@Override
+	public ArgType getType() {
+		if (sVar != null) {
+			return sVar.getTypeInfo().getType();
+		}
+		return ArgType.UNKNOWN;
+	}
+	@Override
+	public void setType(ArgType newType) {
+		if (sVar == null) {
+			throw new JadxRuntimeException("Can't change type for register without SSA variable: " + this);
+		}
+		sVar.setType(newType);
+	}
+	public void forceSetInitType(ArgType type) {
+		this.type = type;
+	}
+	@Nullable
+	public ArgType getImmutableType() {
+		if (sVar != null) {
+			return sVar.getImmutableType();
+		}
+		if (contains(AFlag.IMMUTABLE_TYPE)) {
+			return type;
+		}
+		return null;
+	}
+	@Override
+	public boolean isTypeImmutable() {
+		if (sVar != null) {
+			return sVar.isTypeImmutable();
+		}
+		return contains(AFlag.IMMUTABLE_TYPE);
+	}
+	public SSAVar getSVar() {
+		return sVar;
+	}
+	void setSVar(@NotNull SSAVar sVar) {
+		this.sVar = sVar;
+	}
+	public void resetSSAVar() {
+		this.sVar = null;
+	}
+	@Override
+	public String getName() {
+		if (isSuper()) {
+			return SUPER_ARG_NAME;
+		}
+		if (isThis()) {
+			return THIS_ARG_NAME;
+		}
+		if (sVar == null) {
+			return null;
+		}
+		return sVar.getName();
+	}
+	private boolean isSuper() {
+		return contains(AFlag.SUPER);
+	}
+	@Override
+	public void setName(String name) {
+		if (sVar != null && name != null) {
+			sVar.setName(name);
+		}
+	}
+	public void setNameIfUnknown(String name) {
+		if (getName() == null) {
+			setName(name);
+		}
+	}
+	public boolean isNameEquals(InsnArg arg) {
+		String n = getName();
+		if (n == null || !(arg instanceof Named)) {
+			return false;
+		}
+		return n.equals(((Named) arg).getName());
+	}
+	@Override
+	public RegisterArg duplicate() {
+		return duplicate(getRegNum(), getInitType(), sVar);
+	}
+	public RegisterArg duplicate(ArgType initType) {
+		return duplicate(getRegNum(), initType, sVar);
+	}
+	public RegisterArg duplicateWithNewSSAVar(MethodNode mth) {
+		RegisterArg duplicate = duplicate(regNum, getInitType(), null);
+		mth.makeNewSVar(duplicate);
+		return duplicate;
+	}
+	public RegisterArg duplicate(int regNum, @Nullable SSAVar sVar) {
+		return duplicate(regNum, getInitType(), sVar);
+	}
+	public RegisterArg duplicate(int regNum, ArgType initType, @Nullable SSAVar sVar) {
+		RegisterArg dup = new RegisterArg(regNum, initType);
+		if (sVar != null) {
+			dup.setSVar(sVar);
+		}
+		return copyCommonParams(dup);
+	}
+	@Nullable
+	public InsnNode getAssignInsn() {
+		if (sVar == null) {
+			return null;
+		}
+		return sVar.getAssign().getParentInsn();
+	}
+	public boolean equalRegisterAndType(RegisterArg arg) {
+		return regNum == arg.regNum && type.equals(arg.type);
+	}
+	public boolean sameRegAndSVar(InsnArg arg) {
+		if (this == arg) {
+			return true;
+		}
+		if (!arg.isRegister()) {
+			return false;
+		}
+		RegisterArg reg = (RegisterArg) arg;
+		return regNum == reg.getRegNum()
+				&& Objects.equals(sVar, reg.getSVar());
+	}
+	public boolean sameReg(InsnArg arg) {
+		if (!arg.isRegister()) {
+			return false;
+		}
+		return regNum == ((RegisterArg) arg).getRegNum();
+	}
+	public boolean sameType(InsnArg arg) {
+		return this.getType().equals(arg.getType());
+	}
+	public boolean sameCodeVar(RegisterArg arg) {
+		return this.getSVar().getCodeVar() == arg.getSVar().getCodeVar();
+	}
+	public boolean isLinkedToOtherSsaVars() {
+		return getSVar().getCodeVar().getSsaVars().size() > 1;
+	}
+	@Override
+	public int hashCode() {
+		return regNum;
+	}
+	@Override
+	public boolean equals(Object obj) {
+		if (this == obj) {
+			return true;
+		}
+		if (!(obj instanceof RegisterArg)) {
+			return false;
+		}
+		RegisterArg other = (RegisterArg) obj;
+		return regNum == other.regNum
+				&& Objects.equals(sVar, other.getSVar());
+	}
+	@Override
+	public String toShortString() {
+		StringBuilder sb = new StringBuilder();
+		sb.append("r").append(regNum);
+		if (sVar != null) {
+			sb.append('v').append(sVar.getVersion());
+		}
+		return sb.toString();
+	}
+	@Override
+	public String toString() {
+		StringBuilder sb = new StringBuilder();
+		sb.append("(r").append(regNum);
+		if (sVar != null) {
+			sb.append('v').append(sVar.getVersion());
+		}
+		if (getName() != null) {
+			sb.append(" '").append(getName()).append('\'');
+		}
+		ArgType type = sVar != null ? getType() : null;
+		if (type != null) {
+			sb.append(' ').append(type);
+		}
+		ArgType initType = getInitType();
+		if (type == null || (!type.equals(initType) && !type.isTypeKnown())) {
+			sb.append(" I:").append(initType);
+		}
+		if (!isAttrStorageEmpty()) {
+			sb.append(' ').append(getAttributesString());
+		}
+		sb.append(')');
+		return sb.toString();
+	}
+}

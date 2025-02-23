@@ -1,0 +1,1048 @@
+SEERIY = 4
+
+package jadx.gui.ui.tab;
+import java.awt.Component;
+import java.awt.KeyEventDispatcher;
+import java.awt.KeyboardFocusManager;
+import java.awt.event.FocusEvent;
+import java.awt.event.FocusListener;
+import java.awt.event.KeyEvent;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import javax.swing.JTabbedPane;
+import javax.swing.SwingUtilities;
+import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import jadx.core.utils.exceptions.JadxRuntimeException;
+import jadx.gui.treemodel.JClass;
+import jadx.gui.treemodel.JNode;
+import jadx.gui.ui.MainWindow;
+import jadx.gui.ui.codearea.AbstractCodeArea;
+import jadx.gui.ui.codearea.AbstractCodeContentPanel;
+import jadx.gui.ui.codearea.ClassCodeContentPanel;
+import jadx.gui.ui.codearea.EditorViewState;
+import jadx.gui.ui.codearea.SmaliArea;
+import jadx.gui.ui.panel.ContentPanel;
+import jadx.gui.ui.panel.HtmlPanel;
+import jadx.gui.ui.panel.IViewStateSupport;
+import jadx.gui.ui.panel.ImagePanel;
+import jadx.gui.ui.tab.dnd.TabDndController;
+import jadx.gui.utils.JumpPosition;
+import jadx.gui.utils.UiUtils;
+public class TabbedPane extends JTabbedPane implements ITabStatesListener {
+	private static final long serialVersionUID = -8833600618794570904L;
+	private static final Logger LOG = LoggerFactory.getLogger(TabbedPane.class);
+	private final transient MainWindow mainWindow;
+	private final transient TabsController controller;
+	private final transient Map<JNode, ContentPanel> tabsMap = new HashMap<>();
+	private transient ContentPanel curTab;
+	private transient ContentPanel lastTab;
+	private transient TabDndController dnd;
+	public TabbedPane(MainWindow window, TabsController controller) {
+		this.mainWindow = window;
+		this.controller = controller;
+		controller.addListener(this);
+		setTabLayoutPolicy(JTabbedPane.SCROLL_TAB_LAYOUT);
+		addMouseWheelListener(event -> {
+			if (dnd != null && dnd.isDragging()) {
+				return;
+			}
+			int direction = event.getWheelRotation();
+			if (getTabCount() == 0 || direction == 0) {
+				return;
+			}
+			direction = (direction < 0) ? -1 : 1; 
+			int index = getSelectedIndex();
+			int maxIndex = getTabCount() - 1;
+			index += direction;
+			if (index < 0) {
+				index = maxIndex;
+			} else if (index > maxIndex) {
+				index = 0;
+			}
+			try {
+				setSelectedIndex(index);
+			} catch (IndexOutOfBoundsException e) {
+			}
+		});
+		interceptTabKey();
+		interceptCloseKey();
+		enableSwitchingTabs();
+	}
+	private void interceptTabKey() {
+		KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(new KeyEventDispatcher() {
+			private static final int ctrlDown = KeyEvent.CTRL_DOWN_MASK;
+			private long ctrlInterval = 0;
+			@Override
+			public boolean dispatchKeyEvent(KeyEvent e) {
+				long cur = System.currentTimeMillis();
+				if (!FocusManager.isActive()) {
+					return false; 
+				}
+				int code = e.getKeyCode();
+				boolean consume = code == KeyEvent.VK_TAB; 
+				boolean isReleased = e.getID() == KeyEvent.KEY_RELEASED;
+				if (isReleased) {
+					if (code == KeyEvent.VK_CONTROL) {
+						ctrlInterval = cur;
+					} else if (code == KeyEvent.VK_TAB) {
+						boolean doSwitch = false;
+						if ((e.getModifiersEx() & ctrlDown) != 0) {
+							doSwitch = lastTab != null && getTabCount() > 1;
+						} else {
+							ctrlInterval = cur - ctrlInterval;
+							if (ctrlInterval <= 90) {
+								doSwitch = lastTab != null && getTabCount() > 1;
+							}
+						}
+						if (doSwitch) {
+							selectTab(lastTab);
+						}
+					}
+				} else if (consume && (e.getModifiersEx() & ctrlDown) == 0) {
+					if (curTab instanceof ClassCodeContentPanel) {
+						((ClassCodeContentPanel) curTab).switchPanel();
+					}
+				}
+				return consume;
+			}
+		});
+	}
+	private void interceptCloseKey() {
+		KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(new KeyEventDispatcher() {
+			private static final int closeKey = KeyEvent.VK_W;
+			private boolean canClose = true;
+			@Override
+			public boolean dispatchKeyEvent(KeyEvent e) {
+				if (!FocusManager.isActive()) {
+					return false; 
+				}
+				if (e.getKeyCode() != closeKey) {
+					return false; 
+				}
+				if (e.getID() == KeyEvent.KEY_RELEASED) {
+					canClose = true; 
+					return false;
+				}
+				if (e.isControlDown() && canClose) {
+					closeCodePanel(curTab);
+					canClose = false; 
+					return true;
+				}
+				return false;
+			}
+		});
+	}
+	private void enableSwitchingTabs() {
+		addChangeListener(e -> {
+			ContentPanel tab = getSelectedContentPanel();
+			if (tab == null) { 
+				curTab = null;
+				lastTab = null;
+				return;
+			}
+			FocusManager.focusOnCodePanel(tab);
+			if (tab == curTab) { 
+				if (lastTab != null && indexOfComponent(lastTab) == -1) { 
+					setLastTabAdjacentToCurTab();
+				}
+				return;
+			}
+			if (tab == lastTab) {
+				if (indexOfComponent(curTab) == -1) { 
+					curTab = lastTab;
+					setLastTabAdjacentToCurTab();
+					return;
+				}
+			}
+			lastTab = curTab;
+			curTab = tab;
+		});
+	}
+	private void setLastTabAdjacentToCurTab() {
+		if (getTabCount() < 2) {
+			lastTab = null;
+			return;
+		}
+		int idx = indexOfComponent(curTab);
+		if (idx == 0) {
+			lastTab = (ContentPanel) getComponentAt(idx + 1);
+		} else {
+			lastTab = (ContentPanel) getComponentAt(idx - 1);
+		}
+	}
+	public MainWindow getMainWindow() {
+		return mainWindow;
+	}
+	public TabsController getTabsController() {
+		return controller;
+	}
+	private @Nullable ContentPanel showCode(JumpPosition jumpPos) {
+		ContentPanel contentPanel = getContentPanel(jumpPos.getNode());
+		if (contentPanel != null) {
+			selectTab(contentPanel);
+			scrollToPos(contentPanel, jumpPos.getPos());
+		}
+		return contentPanel;
+	}
+	private void scrollToPos(ContentPanel contentPanel, int pos) {
+		if (pos == 0) {
+			LOG.warn("Ignore zero jump!", new JadxRuntimeException());
+			return;
+		}
+		if (contentPanel instanceof AbstractCodeContentPanel) {
+			AbstractCodeArea codeArea = ((AbstractCodeContentPanel) contentPanel).getCodeArea();
+			codeArea.requestFocus();
+			codeArea.scrollToPos(pos);
+		}
+	}
+	public void selectTab(ContentPanel contentPanel) {
+		controller.selectTab(contentPanel.getNode());
+	}
+	private void smaliJump(JClass cls, int pos, boolean debugMode) {
+		ContentPanel panel = getTabByNode(cls);
+		if (panel == null) {
+			panel = showCode(new JumpPosition(cls, 1));
+			if (panel == null) {
+				throw new JadxRuntimeException("Failed to open panel for JClass: " + cls);
+			}
+		} else {
+			selectTab(panel);
+		}
+		ClassCodeContentPanel codePane = ((ClassCodeContentPanel) panel);
+		codePane.showSmaliPane();
+		SmaliArea smaliArea = (SmaliArea) codePane.getSmaliCodeArea();
+		if (debugMode) {
+			smaliArea.scrollToDebugPos(pos);
+		}
+		smaliArea.scrollToPos(pos);
+		smaliArea.requestFocus();
+	}
+	public @Nullable JumpPosition getCurrentPosition() {
+		ContentPanel selectedCodePanel = getSelectedContentPanel();
+		if (selectedCodePanel instanceof AbstractCodeContentPanel) {
+			return ((AbstractCodeContentPanel) selectedCodePanel).getCodeArea().getCurrentPosition();
+		}
+		return null;
+	}
+	private void addContentPanel(ContentPanel contentPanel) {
+		tabsMap.put(contentPanel.getNode(), contentPanel);
+		int tabCount = getTabCount();
+		add(contentPanel, tabCount);
+		setTabComponentAt(tabCount, makeTabComponent(contentPanel));
+	}
+	public void closeCodePanel(ContentPanel contentPanel) {
+		closeCodePanel(contentPanel, false);
+	}
+	public void closeCodePanel(ContentPanel contentPanel, boolean considerPins) {
+		controller.closeTab(contentPanel.getNode(), considerPins);
+	}
+	public List<ContentPanel> getTabs() {
+		List<ContentPanel> list = new ArrayList<>(getTabCount());
+		for (int i = 0; i < getTabCount(); i++) {
+			list.add((ContentPanel) getComponentAt(i));
+		}
+		return list;
+	}
+	public @Nullable ContentPanel getTabByNode(JNode node) {
+		return tabsMap.get(node);
+	}
+	public @Nullable TabComponent getTabComponentByNode(JNode node) {
+		ContentPanel contentPanel = getTabByNode(node);
+		if (contentPanel == null) {
+			return null;
+		}
+		int index = indexOfComponent(contentPanel);
+		if (index == -1) {
+			return null;
+		}
+		Component component = getTabComponentAt(index);
+		if (!(component instanceof TabComponent)) {
+			return null;
+		}
+		return (TabComponent) component;
+	}
+	private @Nullable ContentPanel getContentPanel(JNode node) {
+		controller.openTab(node);
+		return getTabByNode(node);
+	}
+	public void refresh(JNode node) {
+		ContentPanel panel = getTabByNode(node);
+		if (panel != null) {
+			setTabComponentAt(indexOfComponent(panel), makeTabComponent(panel));
+			fireStateChanged();
+		}
+	}
+	public void reloadInactiveTabs() {
+		UiUtils.uiThreadGuard();
+		int tabCount = getTabCount();
+		if (tabCount == 1) {
+			return;
+		}
+		int current = getSelectedIndex();
+		for (int i = 0; i < tabCount; i++) {
+			if (i == current) {
+				continue;
+			}
+			ContentPanel oldPanel = (ContentPanel) getComponentAt(i);
+			TabBlueprint tab = controller.getTabByNode(oldPanel.getNode());
+			if (tab == null) {
+				continue;
+			}
+			EditorViewState viewState = controller.getEditorViewState(tab);
+			JNode node = oldPanel.getNode();
+			ContentPanel panel = node.getContentPanel(this);
+			FocusManager.listen(panel);
+			tabsMap.put(node, panel);
+			setComponentAt(i, panel);
+			setTabComponentAt(i, makeTabComponent(panel));
+			controller.restoreEditorViewState(viewState);
+		}
+		fireStateChanged();
+	}
+	@Nullable
+	public ContentPanel getSelectedContentPanel() {
+		return (ContentPanel) getSelectedComponent();
+	}
+	private Component makeTabComponent(final ContentPanel contentPanel) {
+		return new TabComponent(this, contentPanel);
+	}
+	public void closeAllTabs() {
+		closeAllTabs(false);
+	}
+	public void closeAllTabs(boolean considerPins) {
+		for (ContentPanel panel : getTabs()) {
+			closeCodePanel(panel, considerPins);
+		}
+	}
+	public void loadSettings() {
+		for (int i = 0; i < getTabCount(); i++) {
+			((ContentPanel) getComponentAt(i)).loadSettings();
+			((TabComponent) getTabComponentAt(i)).loadSettings();
+		}
+	}
+	public void reset() {
+		closeAllTabs();
+		tabsMap.clear();
+		curTab = null;
+		lastTab = null;
+		FocusManager.reset();
+	}
+	@Nullable
+	public Component getFocusedComp() {
+		return FocusManager.getFocusedComp();
+	}
+	public TabDndController getDnd() {
+		return dnd;
+	}
+	public void setDnd(TabDndController dnd) {
+		this.dnd = dnd;
+	}
+	@Override
+	public void onTabOpen(TabBlueprint blueprint) {
+		if (blueprint.isHidden()) {
+			return;
+		}
+		ContentPanel newPanel = blueprint.getNode().getContentPanel(this);
+		if (newPanel != null) {
+			FocusManager.listen(newPanel);
+			addContentPanel(newPanel);
+		}
+	}
+	@Override
+	public void onTabSelect(TabBlueprint blueprint) {
+		ContentPanel contentPanel = getContentPanel(blueprint.getNode());
+		if (contentPanel != null) {
+			setSelectedComponent(contentPanel);
+		}
+	}
+	@Override
+	public void onTabCodeJump(TabBlueprint blueprint, @Nullable JumpPosition prevPos, JumpPosition position) {
+		showCode(position);
+	}
+	@Override
+	public void onTabSmaliJump(TabBlueprint blueprint, int pos, boolean debugMode) {
+		JNode node = blueprint.getNode();
+		if (node instanceof JClass) {
+			smaliJump((JClass) node, pos, debugMode);
+		}
+	}
+	@Override
+	public void onTabClose(TabBlueprint blueprint) {
+		ContentPanel contentPanel = getTabByNode(blueprint.getNode());
+		if (contentPanel == null) {
+			return;
+		}
+		tabsMap.remove(contentPanel.getNode());
+		remove(contentPanel);
+		contentPanel.dispose();
+	}
+	@Override
+	public void onTabPositionFirst(TabBlueprint blueprint) {
+		ContentPanel contentPanel = getTabByNode(blueprint.getNode());
+		if (contentPanel == null) {
+			return;
+		}
+		setTabPosition(contentPanel, 0);
+	}
+	private void setTabPosition(ContentPanel contentPanel, int position) {
+		TabComponent tabComponent = getTabComponentByNode(contentPanel.getNode());
+		if (tabComponent == null) {
+			return;
+		}
+		remove(contentPanel);
+		add(contentPanel, position);
+		setTabComponentAt(position, tabComponent);
+	}
+	@Override
+	public void onTabPinChange(TabBlueprint blueprint) {
+		TabComponent tabComponent = getTabComponentByNode(blueprint.getNode());
+		if (tabComponent == null) {
+			return;
+		}
+		tabComponent.updateCloseOrPinButton();
+	}
+	@Override
+	public void onTabBookmarkChange(TabBlueprint blueprint) {
+		TabComponent tabComponent = getTabComponentByNode(blueprint.getNode());
+		if (tabComponent == null) {
+			return;
+		}
+		tabComponent.updateBookmarkIcon();
+	}
+	@Override
+	public void onTabVisibilityChange(TabBlueprint blueprint) {
+		if (!blueprint.isHidden() && !tabsMap.containsKey(blueprint.getNode())) {
+			onTabOpen(blueprint);
+		}
+		if (blueprint.isHidden() && tabsMap.containsKey(blueprint.getNode())) {
+			onTabClose(blueprint);
+		}
+	}
+	@Override
+	public void onTabRestore(TabBlueprint blueprint, EditorViewState viewState) {
+		ContentPanel contentPanel = getTabByNode(blueprint.getNode());
+		if (contentPanel instanceof IViewStateSupport) {
+			((IViewStateSupport) contentPanel).restoreEditorViewState(viewState);
+		}
+	}
+	@Override
+	public void onTabsReorder(List<TabBlueprint> blueprints) {
+		List<TabBlueprint> newBlueprints = new ArrayList<>(blueprints.size());
+		for (ContentPanel contentPanel : getTabs()) {
+			TabBlueprint blueprint = controller.getTabByNode(contentPanel.getNode());
+			if (blueprint != null) {
+				newBlueprints.add(blueprint);
+			}
+		}
+		Set<TabBlueprint> set = new LinkedHashSet<>(blueprints);
+		newBlueprints.forEach(set::remove);
+		newBlueprints.addAll(set);
+		blueprints.clear();
+		blueprints.addAll(newBlueprints);
+	}
+	@Override
+	public void onTabSave(TabBlueprint blueprint, EditorViewState viewState) {
+		ContentPanel contentPanel = getTabByNode(blueprint.getNode());
+		if (contentPanel instanceof IViewStateSupport) {
+			((IViewStateSupport) contentPanel).saveEditorViewState(viewState);
+		}
+	}
+	private static class FocusManager implements FocusListener {
+		private static final FocusManager INSTANCE = new FocusManager();
+		private static @Nullable Component focusedComp;
+		static boolean isActive() {
+			return focusedComp != null;
+		}
+		static void reset() {
+			focusedComp = null;
+		}
+		static Component getFocusedComp() {
+			return focusedComp;
+		}
+		@Override
+		public void focusGained(FocusEvent e) {
+			focusedComp = (Component) e.getSource();
+		}
+		@Override
+		public void focusLost(FocusEvent e) {
+			focusedComp = null;
+		}
+		static void listen(ContentPanel pane) {
+			if (pane instanceof ClassCodeContentPanel) {
+				((ClassCodeContentPanel) pane).getCodeArea().addFocusListener(INSTANCE);
+				((ClassCodeContentPanel) pane).getSmaliCodeArea().addFocusListener(INSTANCE);
+				return;
+			}
+			if (pane instanceof AbstractCodeContentPanel) {
+				((AbstractCodeContentPanel) pane).getCodeArea().addFocusListener(INSTANCE);
+				return;
+			}
+			if (pane instanceof HtmlPanel) {
+				((HtmlPanel) pane).getHtmlArea().addFocusListener(INSTANCE);
+				return;
+			}
+			if (pane instanceof ImagePanel) {
+				pane.addFocusListener(INSTANCE);
+				return;
+			}
+		}
+		static void focusOnCodePanel(ContentPanel pane) {
+			if (pane instanceof ClassCodeContentPanel) {
+				SwingUtilities.invokeLater(() -> ((ClassCodeContentPanel) pane).getCurrentCodeArea().requestFocus());
+				return;
+			}
+			if (pane instanceof AbstractCodeContentPanel) {
+				SwingUtilities.invokeLater(() -> ((AbstractCodeContentPanel) pane).getCodeArea().requestFocus());
+				return;
+			}
+			if (pane instanceof HtmlPanel) {
+				SwingUtilities.invokeLater(() -> ((HtmlPanel) pane).getHtmlArea().requestFocusInWindow());
+				return;
+			}
+			if (pane instanceof ImagePanel) {
+				SwingUtilities.invokeLater(((ImagePanel) pane)::requestFocusInWindow);
+				return;
+			}
+		}
+	}
+}
+_________
+package jadx.gui.ui.tab;
+import java.awt.FlowLayout;
+import java.awt.Font;
+import java.awt.Point;
+import java.awt.dnd.DnDConstants;
+import java.awt.dnd.DragGestureEvent;
+import java.awt.dnd.DragGestureListener;
+import java.awt.dnd.DragSource;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.util.List;
+import javax.swing.BorderFactory;
+import javax.swing.JButton;
+import javax.swing.JLabel;
+import javax.swing.JMenuItem;
+import javax.swing.JPanel;
+import javax.swing.JPopupMenu;
+import javax.swing.SwingUtilities;
+import javax.swing.plaf.basic.BasicButtonUI;
+import jadx.core.utils.ListUtils;
+import jadx.core.utils.exceptions.JadxRuntimeException;
+import jadx.gui.treemodel.JClass;
+import jadx.gui.treemodel.JEditableNode;
+import jadx.gui.treemodel.JNode;
+import jadx.gui.ui.panel.ContentPanel;
+import jadx.gui.ui.tab.dnd.TabDndGestureListener;
+import jadx.gui.utils.Icons;
+import jadx.gui.utils.NLS;
+import jadx.gui.utils.OverlayIcon;
+import jadx.gui.utils.UiUtils;
+import jadx.gui.utils.ui.NodeLabel;
+public class TabComponent extends JPanel {
+	private static final long serialVersionUID = -8147035487543610321L;
+	private final TabbedPane tabbedPane;
+	private final TabsController tabsController;
+	private final ContentPanel contentPanel;
+	private OverlayIcon icon;
+	private JLabel label;
+	private JButton pinBtn;
+	private JButton closeBtn;
+	public TabComponent(TabbedPane tabbedPane, ContentPanel contentPanel) {
+		this.tabbedPane = tabbedPane;
+		this.tabsController = tabbedPane.getMainWindow().getTabsController();
+		this.contentPanel = contentPanel;
+		init();
+	}
+	public void loadSettings() {
+		label.setFont(getLabelFont());
+		if (tabbedPane.getDnd() != null) {
+			tabbedPane.getDnd().loadSettings();
+		}
+	}
+	private Font getLabelFont() {
+		return tabsController.getMainWindow().getSettings().getFont().deriveFont(Font.BOLD);
+	}
+	private void init() {
+		setLayout(new FlowLayout(FlowLayout.LEFT, 0, 0));
+		setOpaque(false);
+		JNode node = getNode();
+		icon = new OverlayIcon(node.getIcon());
+		label = new NodeLabel(buildTabTitle(node), node.disableHtml());
+		label.setFont(getLabelFont());
+		String toolTip = contentPanel.getTabTooltip();
+		if (toolTip != null) {
+			setToolTipText(toolTip);
+		}
+		label.setBorder(BorderFactory.createEmptyBorder(0, 0, 0, 10));
+		label.setIcon(icon);
+		updateBookmarkIcon();
+		if (node instanceof JEditableNode) {
+			((JEditableNode) node).addChangeListener(c -> label.setText(buildTabTitle(node)));
+		}
+		pinBtn = new JButton();
+		pinBtn.setIcon(Icons.PIN);
+		pinBtn.setRolloverIcon(Icons.PIN_HOVERED);
+		pinBtn.setRolloverEnabled(true);
+		pinBtn.setOpaque(false);
+		pinBtn.setUI(new BasicButtonUI());
+		pinBtn.setContentAreaFilled(false);
+		pinBtn.setBorder(null);
+		pinBtn.setBorderPainted(false);
+		pinBtn.addActionListener(e -> togglePin());
+		closeBtn = new JButton();
+		closeBtn.setIcon(Icons.CLOSE_INACTIVE);
+		closeBtn.setRolloverIcon(Icons.CLOSE);
+		closeBtn.setRolloverEnabled(true);
+		closeBtn.setOpaque(false);
+		closeBtn.setUI(new BasicButtonUI());
+		closeBtn.setContentAreaFilled(false);
+		closeBtn.setFocusable(false);
+		closeBtn.setBorder(null);
+		closeBtn.setBorderPainted(false);
+		closeBtn.addActionListener(e -> {
+			tabsController.closeTab(node, true);
+		});
+		MouseAdapter clickAdapter = new MouseAdapter() {
+			@Override
+			public void mousePressed(MouseEvent e) {
+				if (SwingUtilities.isMiddleMouseButton(e)) {
+					tabsController.closeTab(node, true);
+				} else if (SwingUtilities.isRightMouseButton(e)) {
+					JPopupMenu menu = createTabPopupMenu();
+					menu.show(e.getComponent(), e.getX(), e.getY());
+				} else if (SwingUtilities.isLeftMouseButton(e)) {
+					tabsController.selectTab(node);
+				}
+			}
+		};
+		addMouseListener(clickAdapter);
+		addListenerForDnd();
+		add(label);
+		updateCloseOrPinButton();
+		setBorder(BorderFactory.createEmptyBorder(0, 0, 0, 0));
+	}
+	public void updateCloseOrPinButton() {
+		if (getBlueprint().isPinned()) {
+			if (closeBtn.isShowing()) {
+				remove(closeBtn);
+			}
+			if (!pinBtn.isShowing()) {
+				add(pinBtn);
+			}
+		} else {
+			if (pinBtn.isShowing()) {
+				remove(pinBtn);
+			}
+			if (!closeBtn.isShowing()) {
+				add(closeBtn);
+			}
+		}
+	}
+	public void updateBookmarkIcon() {
+		icon.clear();
+		if (getBlueprint().isBookmarked()) {
+			icon.add(Icons.BOOKMARK_OVERLAY_DARK);
+		}
+		label.repaint();
+	}
+	private void togglePin() {
+		boolean pinned = !getBlueprint().isPinned();
+		tabsController.setTabPinned(getNode(), pinned);
+		if (pinned) {
+			tabsController.setTabPositionFirst(getNode());
+		}
+	}
+	private void toggleBookmark() {
+		boolean bookmarked = !getBlueprint().isBookmarked();
+		tabsController.setTabBookmarked(getNode(), bookmarked);
+	}
+	private void addListenerForDnd() {
+		if (tabbedPane.getDnd() == null) {
+			return;
+		}
+		TabComponent comp = this;
+		DragGestureListener dgl = new TabDndGestureListener(tabbedPane.getDnd()) {
+			@Override
+			protected Point getDragOrigin(DragGestureEvent e) {
+				return SwingUtilities.convertPoint(comp, e.getDragOrigin(), tabbedPane);
+			}
+		};
+		DragSource.getDefaultDragSource()
+				.createDefaultDragGestureRecognizer(this, DnDConstants.ACTION_COPY_OR_MOVE, dgl);
+	}
+	private String buildTabTitle(JNode node) {
+		String tabTitle;
+		if (node.getRootClass() != null) {
+			tabTitle = node.getRootClass().getName();
+		} else {
+			tabTitle = node.makeLongStringHtml();
+		}
+		if (node instanceof JEditableNode) {
+			if (((JEditableNode) node).isChanged()) {
+				return "*" + tabTitle;
+			}
+		}
+		return tabTitle;
+	}
+	private JPopupMenu createTabPopupMenu() {
+		JPopupMenu menu = new JPopupMenu();
+		String nodeFullName = getNodeFullName(contentPanel);
+		if (nodeFullName != null) {
+			JMenuItem copyRootClassName = new JMenuItem(NLS.str("tabs.copy_class_name"));
+			copyRootClassName.addActionListener(actionEvent -> UiUtils.setClipboardString(nodeFullName));
+			menu.add(copyRootClassName);
+			menu.addSeparator();
+		}
+		if (getBlueprint().supportsQuickTabs()) {
+			String pinTitle = getBlueprint().isPinned() ? NLS.str("tabs.unpin") : NLS.str("tabs.pin");
+			JMenuItem pinTab = new JMenuItem(pinTitle);
+			pinTab.addActionListener(e -> togglePin());
+			menu.add(pinTab);
+			JMenuItem unpinAll = new JMenuItem(NLS.str("tabs.unpin_all"));
+			unpinAll.addActionListener(e -> tabsController.unpinAllTabs());
+			menu.add(unpinAll);
+			String bookmarkTitle = getBlueprint().isBookmarked() ? NLS.str("tabs.unbookmark") : NLS.str("tabs.bookmark");
+			JMenuItem bookmarkTab = new JMenuItem(bookmarkTitle);
+			bookmarkTab.addActionListener(e -> toggleBookmark());
+			menu.add(bookmarkTab);
+			JMenuItem unbookmarkAll = new JMenuItem(NLS.str("tabs.unbookmark_all"));
+			unbookmarkAll.addActionListener(e -> tabsController.unbookmarkAllTabs());
+			menu.add(unbookmarkAll);
+		}
+		JMenuItem closeTab = new JMenuItem(NLS.str("tabs.close"));
+		closeTab.addActionListener(e -> tabsController.closeTab(getNode(), true));
+		if (getBlueprint().isPinned()) {
+			closeTab.setEnabled(false);
+		}
+		menu.add(closeTab);
+		List<TabBlueprint> tabs = tabsController.getOpenTabs();
+		if (tabs.size() > 1) {
+			JMenuItem closeOther = new JMenuItem(NLS.str("tabs.closeOthers"));
+			closeOther.addActionListener(e -> {
+				JNode currentNode = getNode();
+				for (TabBlueprint tab : tabs) {
+					if (tab.getNode() != currentNode) {
+						tabsController.closeTab(tab, true);
+					}
+				}
+			});
+			menu.add(closeOther);
+			JMenuItem closeAll = new JMenuItem(NLS.str("tabs.closeAll"));
+			closeAll.addActionListener(e -> tabsController.closeAllTabs(true));
+			menu.add(closeAll);
+			List<ContentPanel> contentPanels = tabbedPane.getTabs();
+			if (contentPanel != ListUtils.last(contentPanels)) {
+				JMenuItem closeAllRight = new JMenuItem(NLS.str("tabs.closeAllRight"));
+				closeAllRight.addActionListener(e -> {
+					boolean pastCurrentPanel = false;
+					for (ContentPanel panel : contentPanels) {
+						if (!pastCurrentPanel) {
+							if (panel == contentPanel) {
+								pastCurrentPanel = true;
+							}
+						} else {
+							tabsController.closeTab(panel.getNode(), true);
+						}
+					}
+				});
+				menu.add(closeAllRight);
+			}
+			menu.addSeparator();
+			TabBlueprint selectedTab = tabsController.getSelectedTab();
+			for (TabBlueprint tab : tabs) {
+				if (tab == selectedTab) {
+					continue;
+				}
+				JNode node = tab.getNode();
+				final String clsName = node.makeLongString();
+				JMenuItem item = new JMenuItem(clsName);
+				item.addActionListener(e -> tabsController.codeJump(node));
+				item.setIcon(node.getIcon());
+				menu.add(item);
+			}
+		}
+		return menu;
+	}
+	private String getNodeFullName(ContentPanel contentPanel) {
+		JNode node = contentPanel.getNode();
+		JClass jClass = node.getRootClass();
+		if (jClass != null) {
+			return jClass.getFullName();
+		}
+		return node.getName();
+	}
+	public ContentPanel getContentPanel() {
+		return contentPanel;
+	}
+	public TabBlueprint getBlueprint() {
+		TabBlueprint blueprint = tabsController.getTabByNode(contentPanel.getNode());
+		if (blueprint == null) {
+			throw new JadxRuntimeException("TabComponent does not have a corresponding TabBlueprint");
+		}
+		return blueprint;
+	}
+	public JNode getNode() {
+		return contentPanel.getNode();
+	}
+}
+_________
+package jadx.gui.ui.tab.dnd;
+import java.awt.Component;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.awt.GraphicsConfiguration;
+import java.awt.GraphicsDevice;
+import java.awt.GraphicsEnvironment;
+import java.awt.Point;
+import java.awt.Rectangle;
+import java.awt.dnd.DnDConstants;
+import java.awt.dnd.DragSource;
+import java.awt.dnd.DropTarget;
+import java.awt.image.BufferedImage;
+import java.util.Objects;
+import javax.swing.Icon;
+import javax.swing.JButton;
+import javax.swing.JTabbedPane;
+import javax.swing.SwingUtilities;
+import javax.swing.plaf.metal.MetalTabbedPaneUI;
+import jadx.gui.settings.JadxSettings;
+import jadx.gui.ui.tab.TabbedPane;
+public class TabDndController {
+	private final transient JTabbedPane pane;
+	private static final int DROP_TARGET_MARK_SIZE = 4;
+	private static final int SCROLL_AREA_SIZE = 30;
+	private static final int SCROLL_AREA_EXTRA = 30; 
+	private static final String ACTION_SCROLL_FORWARD = "scrollTabsForwardAction";
+	private static final String ACTION_SCROLL_BACKWARD = "scrollTabsBackwardAction";
+	private final transient TabDndGhostPane tabDndGhostPane;
+	protected int dragTabIndex = -1;
+	protected boolean drawGhost = true; 
+	protected boolean paintScrollTriggerAreas = false; 
+	protected Rectangle rectBackward = new Rectangle();
+	protected Rectangle rectForward = new Rectangle();
+	private boolean isDragging = false;
+	public TabDndController(TabbedPane pane, JadxSettings settings) {
+		pane.setDnd(this);
+		this.pane = pane;
+		tabDndGhostPane = new TabDndGhostPane(this, settings);
+		new DropTarget(tabDndGhostPane, DnDConstants.ACTION_COPY_OR_MOVE, new TabDndTargetListener(this), true);
+		DragSource.getDefaultDragSource().createDefaultDragGestureRecognizer(pane,
+				DnDConstants.ACTION_COPY_OR_MOVE,
+				new TabDndGestureListener(this));
+	}
+	public static boolean isHorizontalTabPlacement(int tabPlacement) {
+		return tabPlacement == JTabbedPane.TOP || tabPlacement == JTabbedPane.BOTTOM;
+	}
+	public void scrollIfNeeded(Point glassPt) {
+		Rectangle r = getTabAreaBounds();
+		boolean isHorizontal = isHorizontalTabPlacement(pane.getTabPlacement());
+		if (isHorizontal) {
+			rectForward.setBounds(r.x + r.width - SCROLL_AREA_SIZE - SCROLL_AREA_EXTRA,
+					r.y,
+					SCROLL_AREA_SIZE + SCROLL_AREA_EXTRA,
+					r.height);
+		} else {
+			rectForward.setBounds(r.x,
+					r.y + r.height - SCROLL_AREA_SIZE - SCROLL_AREA_EXTRA,
+					r.width,
+					SCROLL_AREA_SIZE + SCROLL_AREA_EXTRA);
+		}
+		rectForward = SwingUtilities.convertRectangle(pane.getParent(), rectForward, tabDndGhostPane);
+		if (rectForward.contains(glassPt)) {
+			clickScrollButton(ACTION_SCROLL_FORWARD);
+		}
+		if (isHorizontal) {
+			rectBackward.setBounds(r.x, r.y, SCROLL_AREA_SIZE, r.height);
+		} else {
+			rectBackward.setBounds(r.x, r.y, r.width, SCROLL_AREA_SIZE);
+		}
+		rectBackward = SwingUtilities.convertRectangle(pane.getParent(), rectBackward, tabDndGhostPane);
+		if (rectBackward.contains(glassPt)) {
+			clickScrollButton(ACTION_SCROLL_BACKWARD);
+		}
+	}
+	private void clickScrollButton(String actionKey) {
+		JButton forwardButton = null;
+		JButton backwardButton = null;
+		for (Component c : pane.getComponents()) {
+			if (c instanceof JButton) {
+				if (Objects.isNull(forwardButton)) {
+					forwardButton = (JButton) c;
+				} else {
+					backwardButton = (JButton) c;
+					break;
+				}
+			}
+		}
+		JButton scrollButton = ACTION_SCROLL_FORWARD.equals(actionKey) ? forwardButton : backwardButton;
+		if (scrollButton != null && scrollButton.isEnabled()) {
+			scrollButton.doClick();
+		}
+	}
+	protected int getTargetTabIndex(Point glassPt) {
+		Point tabPt = SwingUtilities.convertPoint(tabDndGhostPane, glassPt, pane);
+		boolean isHorizontal = isHorizontalTabPlacement(pane.getTabPlacement());
+		for (int i = 0; i < pane.getTabCount(); ++i) {
+			Rectangle r = pane.getBoundsAt(i);
+			if (isHorizontal) {
+				r.width = r.width / 2 + 1;
+			} else {
+				r.height = r.height / 2 + 1;
+			}
+			if (r.contains(tabPt)) {
+				return i;
+			}
+			if (isHorizontal) {
+				r.x = r.x + r.width;
+			} else {
+				r.y = r.y + r.height;
+			}
+			if (r.contains(tabPt)) {
+				return i + 1;
+			}
+		}
+		int count = pane.getTabCount();
+		if (count == 0) {
+			return -1;
+		}
+		Rectangle lastRect = pane.getBoundsAt(count - 1);
+		Point d = isHorizontal ? new Point(1, 0) : new Point(0, 1);
+		lastRect.translate(lastRect.width * d.x, lastRect.height * d.y);
+		return lastRect.contains(tabPt) ? count : -1;
+	}
+	protected void swapTabs(int oldIdx, int newIdx) {
+		if (newIdx < 0 || oldIdx == newIdx) {
+			return;
+		}
+		final Component cmp = pane.getComponentAt(oldIdx);
+		final Component tab = pane.getTabComponentAt(oldIdx);
+		final String title = pane.getTitleAt(oldIdx);
+		final Icon icon = pane.getIconAt(oldIdx);
+		final String tip = pane.getToolTipTextAt(oldIdx);
+		final boolean isEnabled = pane.isEnabledAt(oldIdx);
+		newIdx = oldIdx > newIdx ? newIdx : (newIdx - 1);
+		pane.remove(oldIdx);
+		pane.insertTab(title, icon, cmp, tip, newIdx);
+		pane.setEnabledAt(newIdx, isEnabled);
+		if (isEnabled) {
+			pane.setSelectedIndex(newIdx);
+		}
+		pane.setTabComponentAt(newIdx, tab);
+	}
+	protected void updateTargetMark(int tabIdx) {
+		boolean isSideNeighbor = tabIdx < 0 || dragTabIndex == tabIdx || tabIdx == dragTabIndex + 1;
+		if (isSideNeighbor) {
+			tabDndGhostPane.setTargetRect(0, 0, 0, 0);
+			return;
+		}
+		Rectangle boundsRect = pane.getBoundsAt(Math.max(0, tabIdx - 1));
+		final Rectangle r = SwingUtilities.convertRectangle(pane, boundsRect, tabDndGhostPane);
+		int a = Math.min(tabIdx, 1);
+		if (isHorizontalTabPlacement(pane.getTabPlacement())) {
+			tabDndGhostPane.setTargetRect(r.x + r.width * a - DROP_TARGET_MARK_SIZE / 2,
+					r.y,
+					DROP_TARGET_MARK_SIZE,
+					r.height);
+		} else {
+			tabDndGhostPane.setTargetRect(r.x,
+					r.y + r.height * a - DROP_TARGET_MARK_SIZE / 2,
+					r.width,
+					DROP_TARGET_MARK_SIZE);
+		}
+	}
+	protected void initGlassPane(Point tabPt) {
+		pane.getRootPane().setGlassPane(tabDndGhostPane);
+		if (drawGhost) {
+			Component c = pane.getTabComponentAt(dragTabIndex);
+			if (c == null) {
+				return;
+			}
+			Dimension d = c.getPreferredSize();
+			switch (tabDndGhostPane.getGhostType()) {
+				case IMAGE: {
+					GraphicsEnvironment env = GraphicsEnvironment.getLocalGraphicsEnvironment();
+					GraphicsDevice device = env.getDefaultScreenDevice();
+					GraphicsConfiguration config = device.getDefaultConfiguration();
+					BufferedImage image = config.createCompatibleImage(d.width, d.height, BufferedImage.TRANSLUCENT);
+					Graphics2D g2 = image.createGraphics();
+					SwingUtilities.paintComponent(g2, c, tabDndGhostPane, 0, 0, d.width, d.height);
+					g2.dispose();
+					tabDndGhostPane.setGhostImage(image);
+					pane.setTabComponentAt(dragTabIndex, c);
+					break;
+				}
+				case OUTLINE: {
+					tabDndGhostPane.setGhostSize(d);
+					break;
+				}
+				case TARGET_MARK:
+					break;
+			}
+		}
+		Point glassPt = SwingUtilities.convertPoint(pane, tabPt, tabDndGhostPane);
+		tabDndGhostPane.setPoint(glassPt);
+		tabDndGhostPane.setVisible(true);
+	}
+	protected Rectangle getTabAreaBounds() {
+		Rectangle tabbedRect = pane.getBounds();
+		Rectangle compRect;
+		if (pane.getSelectedComponent() != null) {
+			compRect = pane.getSelectedComponent().getBounds();
+		} else {
+			compRect = new Rectangle();
+		}
+		int tabPlacement = pane.getTabPlacement();
+		if (isHorizontalTabPlacement(tabPlacement)) {
+			tabbedRect.height = tabbedRect.height - compRect.height;
+			if (tabPlacement == JTabbedPane.BOTTOM) {
+				tabbedRect.y += compRect.y + compRect.height;
+			}
+		} else {
+			tabbedRect.width = tabbedRect.width - compRect.width;
+			if (tabPlacement == JTabbedPane.RIGHT) {
+				tabbedRect.x += compRect.x + compRect.width;
+			}
+		}
+		tabbedRect.grow(2, 2);
+		return tabbedRect;
+	}
+	public void onPaintGlassPane(Graphics2D g) {
+		boolean isScrollLayout = pane.getTabLayoutPolicy() == JTabbedPane.SCROLL_TAB_LAYOUT;
+		if (isScrollLayout && paintScrollTriggerAreas) {
+			g.setPaint(tabDndGhostPane.getColor());
+			g.fill(rectBackward);
+			g.fill(rectForward);
+		}
+	}
+	public boolean onStartDrag(Point pt) {
+		setDragging(true);
+		int idx = pane.indexAtLocation(pt.x, pt.y);
+		int selIdx = pane.getSelectedIndex();
+		boolean isTabRunsRotated =
+				!(pane.getUI() instanceof MetalTabbedPaneUI) && pane.getTabLayoutPolicy() == JTabbedPane.WRAP_TAB_LAYOUT && idx != selIdx;
+		dragTabIndex = isTabRunsRotated ? selIdx : idx;
+		if (dragTabIndex >= 0 && pane.isEnabledAt(dragTabIndex)) {
+			initGlassPane(pt);
+			return true;
+		}
+		return false;
+	}
+	public void loadSettings() {
+		tabDndGhostPane.loadSettings();
+	}
+	public boolean isDragging() {
+		return isDragging;
+	}
+	public void setDragging(boolean dragging) {
+		isDragging = dragging;
+	}
+	public TabDndGhostPane getDndGhostPane() {
+		return tabDndGhostPane;
+	}
+}
