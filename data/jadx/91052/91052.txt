@@ -1,0 +1,1153 @@
+SEVERITY = 4
+
+package jadx.api;
+import java.io.Closeable;
+import java.io.File;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import jadx.api.args.GeneratedRenamesMappingFileMode;
+import jadx.api.args.IntegerFormat;
+import jadx.api.args.ResourceNameSource;
+import jadx.api.args.UseSourceNameAsClassNameAlias;
+import jadx.api.args.UserRenamesMappingsMode;
+import jadx.api.data.ICodeData;
+import jadx.api.deobf.IAliasProvider;
+import jadx.api.deobf.IRenameCondition;
+import jadx.api.impl.AnnotatedCodeWriter;
+import jadx.api.impl.InMemoryCodeCache;
+import jadx.api.plugins.loader.JadxBasePluginLoader;
+import jadx.api.plugins.loader.JadxPluginLoader;
+import jadx.api.security.IJadxSecurity;
+import jadx.api.security.JadxSecurityFlag;
+import jadx.api.security.impl.JadxSecurity;
+import jadx.api.usage.IUsageInfoCache;
+import jadx.api.usage.impl.InMemoryUsageInfoCache;
+import jadx.core.deobf.DeobfAliasProvider;
+import jadx.core.deobf.conditions.DeobfWhitelist;
+import jadx.core.deobf.conditions.JadxRenameConditions;
+import jadx.core.plugins.PluginContext;
+import jadx.core.plugins.files.IJadxFilesGetter;
+import jadx.core.plugins.files.TempFilesGetter;
+import jadx.core.utils.files.FileUtils;
+public class JadxArgs implements Closeable {
+	private static final Logger LOG = LoggerFactory.getLogger(JadxArgs.class);
+	public static final int DEFAULT_THREADS_COUNT = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
+	public static final String DEFAULT_NEW_LINE_STR = System.lineSeparator();
+	public static final String DEFAULT_INDENT_STR = "    ";
+	public static final String DEFAULT_OUT_DIR = "jadx-output";
+	public static final String DEFAULT_SRC_DIR = "sources";
+	public static final String DEFAULT_RES_DIR = "resources";
+	private List<File> inputFiles = new ArrayList<>(1);
+	private File outDir;
+	private File outDirSrc;
+	private File outDirRes;
+	private ICodeCache codeCache = new InMemoryCodeCache();
+	private IUsageInfoCache usageInfoCache = new InMemoryUsageInfoCache();
+	private Function<JadxArgs, ICodeWriter> codeWriterProvider = AnnotatedCodeWriter::new;
+	private int threadsCount = DEFAULT_THREADS_COUNT;
+	private boolean cfgOutput = false;
+	private boolean rawCFGOutput = false;
+	private boolean showInconsistentCode = false;
+	private boolean useImports = true;
+	private boolean debugInfo = true;
+	private boolean insertDebugLines = false;
+	private boolean extractFinally = true;
+	private boolean inlineAnonymousClasses = true;
+	private boolean inlineMethods = true;
+	private boolean allowInlineKotlinLambda = true;
+	private boolean moveInnerClasses = true;
+	private boolean skipResources = false;
+	private boolean skipSources = false;
+	private Predicate<String> classFilter = null;
+	private boolean includeDependencies = false;
+	private Path userRenamesMappingsPath = null;
+	private UserRenamesMappingsMode userRenamesMappingsMode = UserRenamesMappingsMode.getDefault();
+	private boolean deobfuscationOn = false;
+	private UseSourceNameAsClassNameAlias useSourceNameAsClassNameAlias = UseSourceNameAsClassNameAlias.getDefault();
+	private int sourceNameRepeatLimit = 10;
+	private File generatedRenamesMappingFile = null;
+	private GeneratedRenamesMappingFileMode generatedRenamesMappingFileMode = GeneratedRenamesMappingFileMode.getDefault();
+	private ResourceNameSource resourceNameSource = ResourceNameSource.AUTO;
+	private int deobfuscationMinLength = 0;
+	private int deobfuscationMaxLength = Integer.MAX_VALUE;
+	private List<String> deobfuscationWhitelist = DeobfWhitelist.DEFAULT_LIST;
+	private IAliasProvider aliasProvider = new DeobfAliasProvider();
+	private IRenameCondition renameCondition = JadxRenameConditions.buildDefault();
+	private boolean escapeUnicode = false;
+	private boolean replaceConsts = true;
+	private boolean respectBytecodeAccModifiers = false;
+	private boolean exportAsGradleProject = false;
+	private boolean restoreSwitchOverString = true;
+	private boolean skipXmlPrettyPrint = false;
+	private boolean fsCaseSensitive;
+	public enum RenameEnum {
+		CASE, VALID, PRINTABLE
+	}
+	private Set<RenameEnum> renameFlags = EnumSet.allOf(RenameEnum.class);
+	public enum OutputFormatEnum {
+		JAVA, JSON
+	}
+	private OutputFormatEnum outputFormat = OutputFormatEnum.JAVA;
+	private DecompilationMode decompilationMode = DecompilationMode.AUTO;
+	private ICodeData codeData;
+	private String codeNewLineStr = DEFAULT_NEW_LINE_STR;
+	private String codeIndentStr = DEFAULT_INDENT_STR;
+	private CommentsLevel commentsLevel = CommentsLevel.INFO;
+	private IntegerFormat integerFormat = IntegerFormat.AUTO;
+	private boolean useDxInput = false;
+	public enum UseKotlinMethodsForVarNames {
+		DISABLE, APPLY, APPLY_AND_HIDE
+	}
+	private UseKotlinMethodsForVarNames useKotlinMethodsForVarNames = UseKotlinMethodsForVarNames.APPLY;
+	private IJadxFilesGetter filesGetter = TempFilesGetter.INSTANCE;
+	private IJadxSecurity security = new JadxSecurity(JadxSecurityFlag.all());
+	private boolean skipFilesSave = false;
+	private boolean runDebugChecks = false;
+	private Map<String, String> pluginOptions = new HashMap<>();
+	private Set<String> disabledPlugins = new HashSet<>();
+	private JadxPluginLoader pluginLoader = new JadxBasePluginLoader();
+	private boolean loadJadxClsSetFile = true;
+	public JadxArgs() {
+	}
+	public void setRootDir(File rootDir) {
+		setOutDir(rootDir);
+		setOutDirSrc(new File(rootDir, DEFAULT_SRC_DIR));
+		setOutDirRes(new File(rootDir, DEFAULT_RES_DIR));
+	}
+	@Override
+	public void close() {
+		try {
+			inputFiles = null;
+			if (codeCache != null) {
+				codeCache.close();
+			}
+			if (usageInfoCache != null) {
+				usageInfoCache.close();
+			}
+			if (pluginLoader != null) {
+				pluginLoader.close();
+			}
+		} catch (Exception e) {
+			LOG.error("Failed to close JadxArgs", e);
+		} finally {
+			codeCache = null;
+			usageInfoCache = null;
+		}
+	}
+	public List<File> getInputFiles() {
+		return inputFiles;
+	}
+	public void setInputFile(File inputFile) {
+		this.inputFiles = Collections.singletonList(inputFile);
+	}
+	public void setInputFiles(List<File> inputFiles) {
+		this.inputFiles = inputFiles;
+	}
+	public File getOutDir() {
+		return outDir;
+	}
+	public void setOutDir(File outDir) {
+		this.outDir = outDir;
+	}
+	public File getOutDirSrc() {
+		return outDirSrc;
+	}
+	public void setOutDirSrc(File outDirSrc) {
+		this.outDirSrc = outDirSrc;
+	}
+	public File getOutDirRes() {
+		return outDirRes;
+	}
+	public void setOutDirRes(File outDirRes) {
+		this.outDirRes = outDirRes;
+	}
+	public int getThreadsCount() {
+		return threadsCount;
+	}
+	public void setThreadsCount(int threadsCount) {
+		this.threadsCount = Math.max(1, threadsCount); 
+	}
+	public boolean isCfgOutput() {
+		return cfgOutput;
+	}
+	public void setCfgOutput(boolean cfgOutput) {
+		this.cfgOutput = cfgOutput;
+	}
+	public boolean isRawCFGOutput() {
+		return rawCFGOutput;
+	}
+	public void setRawCFGOutput(boolean rawCFGOutput) {
+		this.rawCFGOutput = rawCFGOutput;
+	}
+	public boolean isFallbackMode() {
+		return decompilationMode == DecompilationMode.FALLBACK;
+	}
+	@Deprecated
+	public void setFallbackMode(boolean fallbackMode) {
+		if (fallbackMode) {
+			this.decompilationMode = DecompilationMode.FALLBACK;
+		}
+	}
+	public boolean isShowInconsistentCode() {
+		return showInconsistentCode;
+	}
+	public void setShowInconsistentCode(boolean showInconsistentCode) {
+		this.showInconsistentCode = showInconsistentCode;
+	}
+	public boolean isUseImports() {
+		return useImports;
+	}
+	public void setUseImports(boolean useImports) {
+		this.useImports = useImports;
+	}
+	public boolean isDebugInfo() {
+		return debugInfo;
+	}
+	public void setDebugInfo(boolean debugInfo) {
+		this.debugInfo = debugInfo;
+	}
+	public boolean isInsertDebugLines() {
+		return insertDebugLines;
+	}
+	public void setInsertDebugLines(boolean insertDebugLines) {
+		this.insertDebugLines = insertDebugLines;
+	}
+	public boolean isInlineAnonymousClasses() {
+		return inlineAnonymousClasses;
+	}
+	public void setInlineAnonymousClasses(boolean inlineAnonymousClasses) {
+		this.inlineAnonymousClasses = inlineAnonymousClasses;
+	}
+	public boolean isInlineMethods() {
+		return inlineMethods;
+	}
+	public void setInlineMethods(boolean inlineMethods) {
+		this.inlineMethods = inlineMethods;
+	}
+	public boolean isAllowInlineKotlinLambda() {
+		return allowInlineKotlinLambda;
+	}
+	public void setAllowInlineKotlinLambda(boolean allowInlineKotlinLambda) {
+		this.allowInlineKotlinLambda = allowInlineKotlinLambda;
+	}
+	public boolean isMoveInnerClasses() {
+		return moveInnerClasses;
+	}
+	public void setMoveInnerClasses(boolean moveInnerClasses) {
+		this.moveInnerClasses = moveInnerClasses;
+	}
+	public boolean isExtractFinally() {
+		return extractFinally;
+	}
+	public void setExtractFinally(boolean extractFinally) {
+		this.extractFinally = extractFinally;
+	}
+	public boolean isSkipResources() {
+		return skipResources;
+	}
+	public void setSkipResources(boolean skipResources) {
+		this.skipResources = skipResources;
+	}
+	public boolean isSkipSources() {
+		return skipSources;
+	}
+	public void setSkipSources(boolean skipSources) {
+		this.skipSources = skipSources;
+	}
+	public void setIncludeDependencies(boolean includeDependencies) {
+		this.includeDependencies = includeDependencies;
+	}
+	public boolean isIncludeDependencies() {
+		return includeDependencies;
+	}
+	public Predicate<String> getClassFilter() {
+		return classFilter;
+	}
+	public void setClassFilter(Predicate<String> classFilter) {
+		this.classFilter = classFilter;
+	}
+	public Path getUserRenamesMappingsPath() {
+		return userRenamesMappingsPath;
+	}
+	public void setUserRenamesMappingsPath(Path path) {
+		this.userRenamesMappingsPath = path;
+	}
+	public UserRenamesMappingsMode getUserRenamesMappingsMode() {
+		return userRenamesMappingsMode;
+	}
+	public void setUserRenamesMappingsMode(UserRenamesMappingsMode mode) {
+		this.userRenamesMappingsMode = mode;
+	}
+	public boolean isDeobfuscationOn() {
+		return deobfuscationOn;
+	}
+	public void setDeobfuscationOn(boolean deobfuscationOn) {
+		this.deobfuscationOn = deobfuscationOn;
+	}
+	public boolean isDeobfuscationForceSave() {
+		return generatedRenamesMappingFileMode == GeneratedRenamesMappingFileMode.OVERWRITE;
+	}
+	public void setDeobfuscationForceSave(boolean deobfuscationForceSave) {
+		if (deobfuscationForceSave) {
+			this.generatedRenamesMappingFileMode = GeneratedRenamesMappingFileMode.OVERWRITE;
+		}
+	}
+	public GeneratedRenamesMappingFileMode getGeneratedRenamesMappingFileMode() {
+		return generatedRenamesMappingFileMode;
+	}
+	public void setGeneratedRenamesMappingFileMode(GeneratedRenamesMappingFileMode mode) {
+		this.generatedRenamesMappingFileMode = mode;
+	}
+	public UseSourceNameAsClassNameAlias getUseSourceNameAsClassNameAlias() {
+		return useSourceNameAsClassNameAlias;
+	}
+	public void setUseSourceNameAsClassNameAlias(UseSourceNameAsClassNameAlias useSourceNameAsClassNameAlias) {
+		this.useSourceNameAsClassNameAlias = useSourceNameAsClassNameAlias;
+	}
+	public int getSourceNameRepeatLimit() {
+		return sourceNameRepeatLimit;
+	}
+	public void setSourceNameRepeatLimit(int sourceNameRepeatLimit) {
+		this.sourceNameRepeatLimit = sourceNameRepeatLimit;
+	}
+	@Deprecated
+	public boolean isUseSourceNameAsClassAlias() {
+		return getUseSourceNameAsClassNameAlias().toBoolean();
+	}
+	@Deprecated
+	public void setUseSourceNameAsClassAlias(boolean useSourceNameAsClassAlias) {
+		final var useSourceNameAsClassNameAlias = UseSourceNameAsClassNameAlias.create(useSourceNameAsClassAlias);
+		setUseSourceNameAsClassNameAlias(useSourceNameAsClassNameAlias);
+	}
+	public int getDeobfuscationMinLength() {
+		return deobfuscationMinLength;
+	}
+	public void setDeobfuscationMinLength(int deobfuscationMinLength) {
+		this.deobfuscationMinLength = deobfuscationMinLength;
+	}
+	public int getDeobfuscationMaxLength() {
+		return deobfuscationMaxLength;
+	}
+	public void setDeobfuscationMaxLength(int deobfuscationMaxLength) {
+		this.deobfuscationMaxLength = deobfuscationMaxLength;
+	}
+	public List<String> getDeobfuscationWhitelist() {
+		return this.deobfuscationWhitelist;
+	}
+	public void setDeobfuscationWhitelist(List<String> deobfuscationWhitelist) {
+		this.deobfuscationWhitelist = deobfuscationWhitelist;
+	}
+	public File getGeneratedRenamesMappingFile() {
+		return generatedRenamesMappingFile;
+	}
+	public void setGeneratedRenamesMappingFile(File file) {
+		this.generatedRenamesMappingFile = file;
+	}
+	public ResourceNameSource getResourceNameSource() {
+		return resourceNameSource;
+	}
+	public void setResourceNameSource(ResourceNameSource resourceNameSource) {
+		this.resourceNameSource = resourceNameSource;
+	}
+	public IAliasProvider getAliasProvider() {
+		return aliasProvider;
+	}
+	public void setAliasProvider(IAliasProvider aliasProvider) {
+		this.aliasProvider = aliasProvider;
+	}
+	public IRenameCondition getRenameCondition() {
+		return renameCondition;
+	}
+	public void setRenameCondition(IRenameCondition renameCondition) {
+		this.renameCondition = renameCondition;
+	}
+	public boolean isEscapeUnicode() {
+		return escapeUnicode;
+	}
+	public void setEscapeUnicode(boolean escapeUnicode) {
+		this.escapeUnicode = escapeUnicode;
+	}
+	public boolean isReplaceConsts() {
+		return replaceConsts;
+	}
+	public void setReplaceConsts(boolean replaceConsts) {
+		this.replaceConsts = replaceConsts;
+	}
+	public boolean isRespectBytecodeAccModifiers() {
+		return respectBytecodeAccModifiers;
+	}
+	public void setRespectBytecodeAccModifiers(boolean respectBytecodeAccModifiers) {
+		this.respectBytecodeAccModifiers = respectBytecodeAccModifiers;
+	}
+	public boolean isExportAsGradleProject() {
+		return exportAsGradleProject;
+	}
+	public void setExportAsGradleProject(boolean exportAsGradleProject) {
+		this.exportAsGradleProject = exportAsGradleProject;
+	}
+	public boolean isRestoreSwitchOverString() {
+		return restoreSwitchOverString;
+	}
+	public void setRestoreSwitchOverString(boolean restoreSwitchOverString) {
+		this.restoreSwitchOverString = restoreSwitchOverString;
+	}
+	public boolean isSkipXmlPrettyPrint() {
+		return skipXmlPrettyPrint;
+	}
+	public void setSkipXmlPrettyPrint(boolean skipXmlPrettyPrint) {
+		this.skipXmlPrettyPrint = skipXmlPrettyPrint;
+	}
+	public boolean isFsCaseSensitive() {
+		return fsCaseSensitive;
+	}
+	public void setFsCaseSensitive(boolean fsCaseSensitive) {
+		this.fsCaseSensitive = fsCaseSensitive;
+	}
+	public boolean isRenameCaseSensitive() {
+		return renameFlags.contains(RenameEnum.CASE);
+	}
+	public void setRenameCaseSensitive(boolean renameCaseSensitive) {
+		updateRenameFlag(renameCaseSensitive, RenameEnum.CASE);
+	}
+	public boolean isRenameValid() {
+		return renameFlags.contains(RenameEnum.VALID);
+	}
+	public void setRenameValid(boolean renameValid) {
+		updateRenameFlag(renameValid, RenameEnum.VALID);
+	}
+	public boolean isRenamePrintable() {
+		return renameFlags.contains(RenameEnum.PRINTABLE);
+	}
+	public void setRenamePrintable(boolean renamePrintable) {
+		updateRenameFlag(renamePrintable, RenameEnum.PRINTABLE);
+	}
+	private void updateRenameFlag(boolean enabled, RenameEnum flag) {
+		if (enabled) {
+			renameFlags.add(flag);
+		} else {
+			renameFlags.remove(flag);
+		}
+	}
+	public void setRenameFlags(Set<RenameEnum> renameFlags) {
+		this.renameFlags = renameFlags;
+	}
+	public Set<RenameEnum> getRenameFlags() {
+		return renameFlags;
+	}
+	public OutputFormatEnum getOutputFormat() {
+		return outputFormat;
+	}
+	public boolean isJsonOutput() {
+		return outputFormat == OutputFormatEnum.JSON;
+	}
+	public void setOutputFormat(OutputFormatEnum outputFormat) {
+		this.outputFormat = outputFormat;
+	}
+	public DecompilationMode getDecompilationMode() {
+		return decompilationMode;
+	}
+	public void setDecompilationMode(DecompilationMode decompilationMode) {
+		this.decompilationMode = decompilationMode;
+	}
+	public ICodeCache getCodeCache() {
+		return codeCache;
+	}
+	public void setCodeCache(ICodeCache codeCache) {
+		this.codeCache = codeCache;
+	}
+	public Function<JadxArgs, ICodeWriter> getCodeWriterProvider() {
+		return codeWriterProvider;
+	}
+	public void setCodeWriterProvider(Function<JadxArgs, ICodeWriter> codeWriterProvider) {
+		this.codeWriterProvider = codeWriterProvider;
+	}
+	public IUsageInfoCache getUsageInfoCache() {
+		return usageInfoCache;
+	}
+	public void setUsageInfoCache(IUsageInfoCache usageInfoCache) {
+		this.usageInfoCache = usageInfoCache;
+	}
+	public ICodeData getCodeData() {
+		return codeData;
+	}
+	public void setCodeData(ICodeData codeData) {
+		this.codeData = codeData;
+	}
+	public String getCodeIndentStr() {
+		return codeIndentStr;
+	}
+	public void setCodeIndentStr(String codeIndentStr) {
+		this.codeIndentStr = codeIndentStr;
+	}
+	public String getCodeNewLineStr() {
+		return codeNewLineStr;
+	}
+	public void setCodeNewLineStr(String codeNewLineStr) {
+		this.codeNewLineStr = codeNewLineStr;
+	}
+	public CommentsLevel getCommentsLevel() {
+		return commentsLevel;
+	}
+	public void setCommentsLevel(CommentsLevel commentsLevel) {
+		this.commentsLevel = commentsLevel;
+	}
+	public IntegerFormat getIntegerFormat() {
+		return integerFormat;
+	}
+	public void setIntegerFormat(IntegerFormat format) {
+		this.integerFormat = format;
+	}
+	public boolean isUseDxInput() {
+		return useDxInput;
+	}
+	public void setUseDxInput(boolean useDxInput) {
+		this.useDxInput = useDxInput;
+	}
+	public UseKotlinMethodsForVarNames getUseKotlinMethodsForVarNames() {
+		return useKotlinMethodsForVarNames;
+	}
+	public void setUseKotlinMethodsForVarNames(UseKotlinMethodsForVarNames useKotlinMethodsForVarNames) {
+		this.useKotlinMethodsForVarNames = useKotlinMethodsForVarNames;
+	}
+	public IJadxFilesGetter getFilesGetter() {
+		return filesGetter;
+	}
+	public void setFilesGetter(IJadxFilesGetter filesGetter) {
+		this.filesGetter = filesGetter;
+	}
+	public IJadxSecurity getSecurity() {
+		return security;
+	}
+	public void setSecurity(IJadxSecurity security) {
+		this.security = security;
+	}
+	public boolean isSkipFilesSave() {
+		return skipFilesSave;
+	}
+	public void setSkipFilesSave(boolean skipFilesSave) {
+		this.skipFilesSave = skipFilesSave;
+	}
+	public boolean isRunDebugChecks() {
+		return runDebugChecks;
+	}
+	public void setRunDebugChecks(boolean runDebugChecks) {
+		this.runDebugChecks = runDebugChecks;
+	}
+	public Map<String, String> getPluginOptions() {
+		return pluginOptions;
+	}
+	public void setPluginOptions(Map<String, String> pluginOptions) {
+		this.pluginOptions = pluginOptions;
+	}
+	public Set<String> getDisabledPlugins() {
+		return disabledPlugins;
+	}
+	public void setDisabledPlugins(Set<String> disabledPlugins) {
+		this.disabledPlugins = disabledPlugins;
+	}
+	public JadxPluginLoader getPluginLoader() {
+		return pluginLoader;
+	}
+	public void setPluginLoader(JadxPluginLoader pluginLoader) {
+		this.pluginLoader = pluginLoader;
+	}
+	public boolean isLoadJadxClsSetFile() {
+		return loadJadxClsSetFile;
+	}
+	public void setLoadJadxClsSetFile(boolean loadJadxClsSetFile) {
+		this.loadJadxClsSetFile = loadJadxClsSetFile;
+	}
+	public String makeCodeArgsHash(@Nullable JadxDecompiler decompiler) {
+		String argStr = "args:" + decompilationMode + useImports + showInconsistentCode
+				+ inlineAnonymousClasses + inlineMethods + moveInnerClasses + allowInlineKotlinLambda
+				+ deobfuscationOn + deobfuscationMinLength + deobfuscationMaxLength + deobfuscationWhitelist
+				+ useSourceNameAsClassNameAlias + sourceNameRepeatLimit
+				+ resourceNameSource
+				+ useKotlinMethodsForVarNames
+				+ insertDebugLines + extractFinally
+				+ debugInfo + escapeUnicode + replaceConsts + restoreSwitchOverString
+				+ respectBytecodeAccModifiers + fsCaseSensitive + renameFlags
+				+ commentsLevel + useDxInput + integerFormat
+				+ "|" + buildPluginsHash(decompiler);
+		return FileUtils.md5Sum(argStr);
+	}
+	private static String buildPluginsHash(@Nullable JadxDecompiler decompiler) {
+		if (decompiler == null) {
+			return "";
+		}
+		return decompiler.getPluginManager().getResolvedPluginContexts()
+				.stream()
+				.map(PluginContext::getInputsHash)
+				.collect(Collectors.joining(":"));
+	}
+	@Override
+	public String toString() {
+		return "JadxArgs{" + "inputFiles=" + inputFiles
+				+ ", outDir=" + outDir
+				+ ", outDirSrc=" + outDirSrc
+				+ ", outDirRes=" + outDirRes
+				+ ", threadsCount=" + threadsCount
+				+ ", decompilationMode=" + decompilationMode
+				+ ", showInconsistentCode=" + showInconsistentCode
+				+ ", useImports=" + useImports
+				+ ", skipResources=" + skipResources
+				+ ", skipSources=" + skipSources
+				+ ", includeDependencies=" + includeDependencies
+				+ ", userRenamesMappingsPath=" + userRenamesMappingsPath
+				+ ", userRenamesMappingsMode=" + userRenamesMappingsMode
+				+ ", deobfuscationOn=" + deobfuscationOn
+				+ ", generatedRenamesMappingFile=" + generatedRenamesMappingFile
+				+ ", generatedRenamesMappingFileMode=" + generatedRenamesMappingFileMode
+				+ ", resourceNameSource=" + resourceNameSource
+				+ ", useSourceNameAsClassNameAlias=" + useSourceNameAsClassNameAlias
+				+ ", sourceNameRepeatLimit=" + sourceNameRepeatLimit
+				+ ", useKotlinMethodsForVarNames=" + useKotlinMethodsForVarNames
+				+ ", insertDebugLines=" + insertDebugLines
+				+ ", extractFinally=" + extractFinally
+				+ ", deobfuscationMinLength=" + deobfuscationMinLength
+				+ ", deobfuscationMaxLength=" + deobfuscationMaxLength
+				+ ", deobfuscationWhitelist=" + deobfuscationWhitelist
+				+ ", escapeUnicode=" + escapeUnicode
+				+ ", replaceConsts=" + replaceConsts
+				+ ", restoreSwitchOverString=" + restoreSwitchOverString
+				+ ", respectBytecodeAccModifiers=" + respectBytecodeAccModifiers
+				+ ", exportAsGradleProject=" + exportAsGradleProject
+				+ ", skipXmlPrettyPrint=" + skipXmlPrettyPrint
+				+ ", fsCaseSensitive=" + fsCaseSensitive
+				+ ", renameFlags=" + renameFlags
+				+ ", outputFormat=" + outputFormat
+				+ ", commentsLevel=" + commentsLevel
+				+ ", codeCache=" + codeCache
+				+ ", codeWriter=" + codeWriterProvider.apply(this).getClass().getSimpleName()
+				+ ", useDxInput=" + useDxInput
+				+ ", pluginOptions=" + pluginOptions
+				+ ", cfgOutput=" + cfgOutput
+				+ ", rawCFGOutput=" + rawCFGOutput
+				+ '}';
+	}
+}
+______
+package jadx.core;
+import java.io.InputStream;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Enumeration;
+import java.util.List;
+import java.util.jar.Manifest;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import jadx.api.CommentsLevel;
+import jadx.api.JadxArgs;
+import jadx.core.deobf.DeobfuscatorVisitor;
+import jadx.core.deobf.SaveDeobfMapping;
+import jadx.core.dex.attributes.AFlag;
+import jadx.core.dex.visitors.AnonymousClassVisitor;
+import jadx.core.dex.visitors.AttachCommentsVisitor;
+import jadx.core.dex.visitors.AttachMethodDetails;
+import jadx.core.dex.visitors.AttachTryCatchVisitor;
+import jadx.core.dex.visitors.CheckCode;
+import jadx.core.dex.visitors.ClassModifier;
+import jadx.core.dex.visitors.ConstInlineVisitor;
+import jadx.core.dex.visitors.ConstructorVisitor;
+import jadx.core.dex.visitors.DeboxingVisitor;
+import jadx.core.dex.visitors.DotGraphVisitor;
+import jadx.core.dex.visitors.EnumVisitor;
+import jadx.core.dex.visitors.ExtractFieldInit;
+import jadx.core.dex.visitors.FallbackModeVisitor;
+import jadx.core.dex.visitors.FixSwitchOverEnum;
+import jadx.core.dex.visitors.GenericTypesVisitor;
+import jadx.core.dex.visitors.IDexTreeVisitor;
+import jadx.core.dex.visitors.InitCodeVariables;
+import jadx.core.dex.visitors.InlineMethods;
+import jadx.core.dex.visitors.MarkMethodsForInline;
+import jadx.core.dex.visitors.MethodInvokeVisitor;
+import jadx.core.dex.visitors.MethodVisitor;
+import jadx.core.dex.visitors.ModVisitor;
+import jadx.core.dex.visitors.MoveInlineVisitor;
+import jadx.core.dex.visitors.OverrideMethodVisitor;
+import jadx.core.dex.visitors.PrepareForCodeGen;
+import jadx.core.dex.visitors.ProcessAnonymous;
+import jadx.core.dex.visitors.ProcessInstructionsVisitor;
+import jadx.core.dex.visitors.ProcessMethodsForInline;
+import jadx.core.dex.visitors.ReplaceNewArray;
+import jadx.core.dex.visitors.ShadowFieldVisitor;
+import jadx.core.dex.visitors.SignatureProcessor;
+import jadx.core.dex.visitors.SimplifyVisitor;
+import jadx.core.dex.visitors.blocks.BlockFinisher;
+import jadx.core.dex.visitors.blocks.BlockProcessor;
+import jadx.core.dex.visitors.blocks.BlockSplitter;
+import jadx.core.dex.visitors.debuginfo.DebugInfoApplyVisitor;
+import jadx.core.dex.visitors.debuginfo.DebugInfoAttachVisitor;
+import jadx.core.dex.visitors.finaly.MarkFinallyVisitor;
+import jadx.core.dex.visitors.fixaccessmodifiers.FixAccessModifiers;
+import jadx.core.dex.visitors.gradle.NonFinalResIdsVisitor;
+import jadx.core.dex.visitors.kotlin.ProcessKotlinInternals;
+import jadx.core.dex.visitors.prepare.AddAndroidConstants;
+import jadx.core.dex.visitors.prepare.CollectConstValues;
+import jadx.core.dex.visitors.regions.CheckRegions;
+import jadx.core.dex.visitors.regions.CleanRegions;
+import jadx.core.dex.visitors.regions.IfRegionVisitor;
+import jadx.core.dex.visitors.regions.LoopRegionVisitor;
+import jadx.core.dex.visitors.regions.RegionMakerVisitor;
+import jadx.core.dex.visitors.regions.ReturnVisitor;
+import jadx.core.dex.visitors.regions.SwitchOverStringVisitor;
+import jadx.core.dex.visitors.regions.variables.ProcessVariables;
+import jadx.core.dex.visitors.rename.CodeRenameVisitor;
+import jadx.core.dex.visitors.rename.RenameVisitor;
+import jadx.core.dex.visitors.rename.SourceFileRename;
+import jadx.core.dex.visitors.shrink.CodeShrinkVisitor;
+import jadx.core.dex.visitors.ssa.SSATransform;
+import jadx.core.dex.visitors.typeinference.FinishTypeInference;
+import jadx.core.dex.visitors.typeinference.FixTypesVisitor;
+import jadx.core.dex.visitors.typeinference.TypeInferenceVisitor;
+import jadx.core.dex.visitors.usage.UsageInfoVisitor;
+import jadx.core.utils.exceptions.JadxRuntimeException;
+public class Jadx {
+	private static final Logger LOG = LoggerFactory.getLogger(Jadx.class);
+	private Jadx() {
+	}
+	public static List<IDexTreeVisitor> getPassesList(JadxArgs args) {
+		switch (args.getDecompilationMode()) {
+			case AUTO:
+			case RESTRUCTURE:
+				return getRegionsModePasses(args);
+			case SIMPLE:
+				return getSimpleModePasses(args);
+			case FALLBACK:
+				return getFallbackPassesList();
+			default:
+				throw new JadxRuntimeException("Unknown decompilation mode: " + args.getDecompilationMode());
+		}
+	}
+	public static List<IDexTreeVisitor> getPreDecompilePassesList() {
+		List<IDexTreeVisitor> passes = new ArrayList<>();
+		passes.add(new SignatureProcessor());
+		passes.add(new OverrideMethodVisitor());
+		passes.add(new AddAndroidConstants());
+		passes.add(new CollectConstValues());
+		passes.add(new DeobfuscatorVisitor());
+		passes.add(new SourceFileRename());
+		passes.add(new RenameVisitor());
+		passes.add(new SaveDeobfMapping());
+		passes.add(new UsageInfoVisitor());
+		passes.add(new ProcessAnonymous());
+		passes.add(new ProcessMethodsForInline());
+		return passes;
+	}
+	public static List<IDexTreeVisitor> getRegionsModePasses(JadxArgs args) {
+		List<IDexTreeVisitor> passes = new ArrayList<>();
+		passes.add(new CheckCode());
+		if (args.isDebugInfo()) {
+			passes.add(new DebugInfoAttachVisitor());
+		}
+		passes.add(new AttachTryCatchVisitor());
+		if (args.getCommentsLevel() != CommentsLevel.NONE) {
+			passes.add(new AttachCommentsVisitor());
+		}
+		passes.add(new AttachMethodDetails());
+		passes.add(new ProcessInstructionsVisitor());
+		passes.add(new BlockSplitter());
+		passes.add(new BlockProcessor());
+		passes.add(new BlockFinisher());
+		if (args.isRawCFGOutput()) {
+			passes.add(DotGraphVisitor.dumpRaw());
+		}
+		passes.add(new SSATransform());
+		passes.add(new MoveInlineVisitor());
+		passes.add(new ConstructorVisitor());
+		passes.add(new InitCodeVariables());
+		if (args.isExtractFinally()) {
+			passes.add(new MarkFinallyVisitor());
+		}
+		passes.add(new ConstInlineVisitor());
+		passes.add(new TypeInferenceVisitor());
+		if (args.isDebugInfo()) {
+			passes.add(new DebugInfoApplyVisitor());
+		}
+		passes.add(new FixTypesVisitor());
+		passes.add(new FinishTypeInference());
+		if (args.getUseKotlinMethodsForVarNames() != JadxArgs.UseKotlinMethodsForVarNames.DISABLE) {
+			passes.add(new ProcessKotlinInternals());
+		}
+		passes.add(new CodeRenameVisitor());
+		if (args.isInlineMethods()) {
+			passes.add(new InlineMethods());
+		}
+		passes.add(new GenericTypesVisitor());
+		passes.add(new ShadowFieldVisitor());
+		passes.add(new DeboxingVisitor());
+		passes.add(new AnonymousClassVisitor());
+		passes.add(new ModVisitor());
+		passes.add(new CodeShrinkVisitor());
+		passes.add(new ReplaceNewArray());
+		if (args.isCfgOutput()) {
+			passes.add(DotGraphVisitor.dump());
+		}
+		passes.add(new RegionMakerVisitor());
+		passes.add(new IfRegionVisitor());
+		if (args.isRestoreSwitchOverString()) {
+			passes.add(new SwitchOverStringVisitor());
+		}
+		passes.add(new ReturnVisitor());
+		passes.add(new CleanRegions());
+		passes.add(new CodeShrinkVisitor());
+		passes.add(new MethodInvokeVisitor());
+		passes.add(new SimplifyVisitor());
+		passes.add(new CheckRegions());
+		passes.add(new EnumVisitor());
+		passes.add(new FixSwitchOverEnum());
+		passes.add(new NonFinalResIdsVisitor());
+		passes.add(new ExtractFieldInit());
+		passes.add(new FixAccessModifiers());
+		passes.add(new ClassModifier());
+		passes.add(new LoopRegionVisitor());
+		if (args.isInlineMethods()) {
+			passes.add(new MarkMethodsForInline());
+		}
+		passes.add(new ProcessVariables());
+		passes.add(new PrepareForCodeGen());
+		if (args.isCfgOutput()) {
+			passes.add(DotGraphVisitor.dumpRegions());
+		}
+		return passes;
+	}
+	public static List<IDexTreeVisitor> getSimpleModePasses(JadxArgs args) {
+		List<IDexTreeVisitor> passes = new ArrayList<>();
+		if (args.isDebugInfo()) {
+			passes.add(new DebugInfoAttachVisitor());
+		}
+		passes.add(new AttachTryCatchVisitor());
+		if (args.getCommentsLevel() != CommentsLevel.NONE) {
+			passes.add(new AttachCommentsVisitor());
+		}
+		passes.add(new AttachMethodDetails());
+		passes.add(new ProcessInstructionsVisitor());
+		passes.add(new BlockSplitter());
+		if (args.isRawCFGOutput()) {
+			passes.add(DotGraphVisitor.dumpRaw());
+		}
+		passes.add(new MethodVisitor("DisableBlockLock", mth -> mth.add(AFlag.DISABLE_BLOCKS_LOCK)));
+		passes.add(new BlockProcessor());
+		passes.add(new SSATransform());
+		passes.add(new MoveInlineVisitor());
+		passes.add(new ConstructorVisitor());
+		passes.add(new InitCodeVariables());
+		passes.add(new ConstInlineVisitor());
+		passes.add(new TypeInferenceVisitor());
+		if (args.isDebugInfo()) {
+			passes.add(new DebugInfoApplyVisitor());
+		}
+		passes.add(new FixTypesVisitor());
+		passes.add(new FinishTypeInference());
+		passes.add(new CodeRenameVisitor());
+		passes.add(new DeboxingVisitor());
+		passes.add(new ModVisitor());
+		passes.add(new CodeShrinkVisitor());
+		passes.add(new ReplaceNewArray());
+		passes.add(new SimplifyVisitor());
+		passes.add(new MethodVisitor("ForceGenerateAll", mth -> mth.remove(AFlag.DONT_GENERATE)));
+		if (args.isCfgOutput()) {
+			passes.add(DotGraphVisitor.dump());
+		}
+		return passes;
+	}
+	public static List<IDexTreeVisitor> getFallbackPassesList() {
+		List<IDexTreeVisitor> passes = new ArrayList<>();
+		passes.add(new AttachTryCatchVisitor());
+		passes.add(new AttachCommentsVisitor());
+		passes.add(new ProcessInstructionsVisitor());
+		passes.add(new FallbackModeVisitor());
+		return passes;
+	}
+	public static final String VERSION_DEV = "dev";
+	private static String version;
+	public static String getVersion() {
+		if (version == null) {
+			version = searchJadxVersion();
+		}
+		return version;
+	}
+	public static boolean isDevVersion() {
+		return getVersion().equals(VERSION_DEV);
+	}
+	private static String searchJadxVersion() {
+		try {
+			ClassLoader classLoader = Jadx.class.getClassLoader();
+			if (classLoader != null) {
+				Enumeration<URL> resources = classLoader.getResources("META-INF/MANIFEST.MF");
+				while (resources.hasMoreElements()) {
+					try (InputStream is = resources.nextElement().openStream()) {
+						Manifest manifest = new Manifest(is);
+						String ver = manifest.getMainAttributes().getValue("jadx-version");
+						if (ver != null) {
+							return ver;
+						}
+					}
+				}
+			}
+		} catch (Exception e) {
+			LOG.error("Can't get manifest file", e);
+		}
+		return VERSION_DEV;
+	}
+}
+______
+package jadx.core.plugins.versions;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import org.jetbrains.annotations.Nullable;
+import jadx.core.Jadx;
+public class VerifyRequiredVersion {
+	public static boolean isJadxCompatible(@Nullable String reqVersionStr) {
+		return new VerifyRequiredVersion().isCompatible(reqVersionStr);
+	}
+	public static void verify(String requiredJadxVersion) {
+		try {
+			parse(requiredJadxVersion);
+		} catch (Exception e) {
+			throw new IllegalArgumentException("Malformed 'requiredJadxVersion': " + e.getMessage(), e);
+		}
+	}
+	private final String jadxVersion;
+	private final boolean unstable;
+	private final boolean dev;
+	public VerifyRequiredVersion() {
+		this(Jadx.getVersion());
+	}
+	public VerifyRequiredVersion(String jadxVersion) {
+		this.jadxVersion = jadxVersion;
+		this.unstable = jadxVersion.startsWith("r");
+		this.dev = jadxVersion.equals(Jadx.VERSION_DEV);
+	}
+	public boolean isCompatible(@Nullable String reqVersionStr) {
+		if (reqVersionStr == null || reqVersionStr.isEmpty()) {
+			return true;
+		}
+		RequiredVersionData reqVer = parse(reqVersionStr);
+		if (dev) {
+			return true;
+		}
+		if (unstable) {
+			return VersionComparator.checkAndCompare(jadxVersion, reqVer.getUnstableRev()) >= 0;
+		}
+		return VersionComparator.checkAndCompare(jadxVersion, reqVer.getReleaseVer()) >= 0;
+	}
+	public String getJadxVersion() {
+		return jadxVersion;
+	}
+	private static final Pattern REQ_VER_FORMAT = Pattern.compile("(\\d+\\.\\d+\\.\\d+),\\s+(r\\d+)");
+	private static RequiredVersionData parse(String reqVersionStr) {
+		Matcher matcher = REQ_VER_FORMAT.matcher(reqVersionStr);
+		if (!matcher.matches()) {
+			throw new RuntimeException("Expect format: " + REQ_VER_FORMAT + ", got: " + reqVersionStr);
+		}
+		return new RequiredVersionData(matcher.group(1), matcher.group(2));
+	}
+	private static final class RequiredVersionData {
+		private final String releaseVer;
+		private final String unstableRev;
+		private RequiredVersionData(String releaseVer, String unstableRev) {
+			this.releaseVer = releaseVer;
+			this.unstableRev = unstableRev;
+		}
+		public String getReleaseVer() {
+			return releaseVer;
+		}
+		public String getUnstableRev() {
+			return unstableRev;
+		}
+	}
+}
+______
+package jadx.core.plugins;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
+import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import jadx.api.JadxDecompiler;
+import jadx.api.plugins.JadxPlugin;
+import jadx.api.plugins.input.JadxCodeInput;
+import jadx.api.plugins.loader.JadxPluginLoader;
+import jadx.api.plugins.options.JadxPluginOptions;
+import jadx.api.plugins.options.OptionDescription;
+import jadx.core.plugins.versions.VerifyRequiredVersion;
+import jadx.core.utils.exceptions.JadxRuntimeException;
+public class JadxPluginManager {
+	private static final Logger LOG = LoggerFactory.getLogger(JadxPluginManager.class);
+	private final JadxDecompiler decompiler;
+	private final JadxPluginsData pluginsData;
+	private final Set<String> disabledPlugins;
+	private final SortedSet<PluginContext> allPlugins = new TreeSet<>();
+	private final SortedSet<PluginContext> resolvedPlugins = new TreeSet<>();
+	private final Map<String, String> provideSuggestions = new TreeMap<>();
+	private final List<Consumer<PluginContext>> addPluginListeners = new ArrayList<>();
+	public JadxPluginManager(JadxDecompiler decompiler) {
+		this.decompiler = decompiler;
+		this.pluginsData = new JadxPluginsData(decompiler, this);
+		this.disabledPlugins = decompiler.getArgs().getDisabledPlugins();
+	}
+	public void providesSuggestion(String provides, String pluginId) {
+		provideSuggestions.put(provides, pluginId);
+	}
+	public void load(JadxPluginLoader pluginLoader) {
+		allPlugins.clear();
+		VerifyRequiredVersion verifyRequiredVersion = new VerifyRequiredVersion();
+		for (JadxPlugin plugin : pluginLoader.load()) {
+			addPlugin(plugin, verifyRequiredVersion);
+		}
+		resolve();
+	}
+	public void register(JadxPlugin plugin) {
+		Objects.requireNonNull(plugin);
+		PluginContext addedPlugin = addPlugin(plugin, new VerifyRequiredVersion());
+		if (addedPlugin == null) {
+			LOG.debug("Can't register plugin, it was disabled: {}", plugin.getPluginInfo().getPluginId());
+			return;
+		}
+		LOG.debug("Register plugin: {}", addedPlugin.getPluginId());
+		resolve();
+	}
+	private @Nullable PluginContext addPlugin(JadxPlugin plugin, VerifyRequiredVersion verifyRequiredVersion) {
+		PluginContext pluginContext = new PluginContext(decompiler, pluginsData, plugin);
+		if (disabledPlugins.contains(pluginContext.getPluginId())) {
+			return null;
+		}
+		String requiredJadxVersion = pluginContext.getPluginInfo().getRequiredJadxVersion();
+		if (!verifyRequiredVersion.isCompatible(requiredJadxVersion)) {
+			LOG.warn("Plugin '{}' not loaded: requires '{}' jadx version which it is not compatible with current: {}",
+					pluginContext, requiredJadxVersion, verifyRequiredVersion.getJadxVersion());
+			return null;
+		}
+		LOG.debug("Loading plugin: {}", pluginContext);
+		if (!allPlugins.add(pluginContext)) {
+			throw new IllegalArgumentException("Duplicate plugin id: " + pluginContext + ", class " + plugin.getClass());
+		}
+		addPluginListeners.forEach(l -> l.accept(pluginContext));
+		return pluginContext;
+	}
+	public boolean unload(String pluginId) {
+		boolean result = allPlugins.removeIf(context -> {
+			if (context.getPluginId().equals(pluginId)) {
+				LOG.debug("Unload plugin: {}", pluginId);
+				return true;
+			}
+			return false;
+		});
+		resolve();
+		return result;
+	}
+	public SortedSet<PluginContext> getAllPluginContexts() {
+		return allPlugins;
+	}
+	public SortedSet<PluginContext> getResolvedPluginContexts() {
+		return resolvedPlugins;
+	}
+	private synchronized void resolve() {
+		Map<String, List<PluginContext>> provides = allPlugins.stream()
+				.collect(Collectors.groupingBy(p -> p.getPluginInfo().getProvides()));
+		List<PluginContext> resolved = new ArrayList<>(provides.size());
+		provides.forEach((provide, list) -> {
+			if (list.size() == 1) {
+				resolved.add(list.get(0));
+			} else {
+				String suggestion = provideSuggestions.get(provide);
+				if (suggestion != null) {
+					list.stream().filter(p -> p.getPluginId().equals(suggestion))
+							.findFirst()
+							.ifPresent(resolved::add);
+				} else {
+					PluginContext selected = list.get(0);
+					resolved.add(selected);
+					LOG.debug("Select providing '{}' plugin '{}', candidates: {}", provide, selected, list);
+				}
+			}
+		});
+		resolvedPlugins.clear();
+		resolvedPlugins.addAll(resolved);
+	}
+	public void initAll() {
+		init(allPlugins);
+	}
+	public void initResolved() {
+		init(resolvedPlugins);
+	}
+	public void init(SortedSet<PluginContext> pluginContexts) {
+		AppContext defAppContext = buildDefaultAppContext();
+		for (PluginContext context : pluginContexts) {
+			try {
+				if (context.getAppContext() == null) {
+					context.setAppContext(defAppContext);
+				}
+				context.init();
+			} catch (Exception e) {
+				throw new JadxRuntimeException("Failed to init plugin: " + context.getPluginId(), e);
+			}
+		}
+		for (PluginContext context : pluginContexts) {
+			JadxPluginOptions options = context.getOptions();
+			if (options != null) {
+				verifyOptions(context, options);
+			}
+		}
+	}
+	private AppContext buildDefaultAppContext() {
+		AppContext appContext = new AppContext();
+		appContext.setGuiContext(null);
+		appContext.setFilesGetter(decompiler.getArgs().getFilesGetter());
+		return appContext;
+	}
+	private void verifyOptions(PluginContext pluginContext, JadxPluginOptions options) {
+		String pluginId = pluginContext.getPluginId();
+		List<OptionDescription> descriptions = options.getOptionsDescriptions();
+		if (descriptions == null) {
+			throw new IllegalArgumentException("Null option descriptions in plugin id: " + pluginId);
+		}
+		String prefix = pluginId + '.';
+		descriptions.forEach(descObj -> {
+			String optName = descObj.name();
+			if (optName == null || !optName.startsWith(prefix)) {
+				throw new IllegalArgumentException("Plugin option name should start with plugin id: '" + prefix + "', option: " + optName);
+			}
+			String desc = descObj.description();
+			if (desc == null || desc.isEmpty()) {
+				throw new IllegalArgumentException("Plugin option description not set, plugin: " + pluginId);
+			}
+			List<String> values = descObj.values();
+			if (values == null) {
+				throw new IllegalArgumentException("Plugin option values is null, option: " + optName + ", plugin: " + pluginId);
+			}
+		});
+	}
+	public List<JadxCodeInput> getCodeInputs() {
+		return getResolvedPluginContexts()
+				.stream()
+				.flatMap(p -> p.getCodeInputs().stream())
+				.collect(Collectors.toList());
+	}
+	public void registerAddPluginListener(Consumer<PluginContext> listener) {
+		this.addPluginListeners.add(listener);
+		getAllPluginContexts().forEach(listener);
+	}
+}

@@ -1,3 +1,5 @@
+SEVERITY = 4
+
 package jadx.core.dex.visitors;
 import java.util.LinkedHashSet;
 import java.util.List;

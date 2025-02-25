@@ -1,0 +1,1081 @@
+SEVERITY = 5
+
+package jadx.core.dex.visitors.regions.maker;
+import java.util.ArrayList;
+import java.util.BitSet;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import org.jetbrains.annotations.Nullable;
+import jadx.core.dex.attributes.AFlag;
+import jadx.core.dex.attributes.AType;
+import jadx.core.dex.nodes.BlockNode;
+import jadx.core.dex.nodes.IBlock;
+import jadx.core.dex.nodes.IContainer;
+import jadx.core.dex.nodes.IRegion;
+import jadx.core.dex.nodes.MethodNode;
+import jadx.core.dex.regions.Region;
+import jadx.core.dex.trycatch.ExcHandlerAttr;
+import jadx.core.dex.trycatch.ExceptionHandler;
+import jadx.core.dex.trycatch.TryCatchBlockAttr;
+import jadx.core.utils.BlockUtils;
+import jadx.core.utils.RegionUtils;
+public class ExcHandlersRegionMaker {
+	private final MethodNode mth;
+	private final RegionMaker regionMaker;
+	public ExcHandlersRegionMaker(MethodNode mth, RegionMaker regionMaker) {
+		this.mth = mth;
+		this.regionMaker = regionMaker;
+	}
+	public void process() {
+		if (mth.isNoExceptionHandlers()) {
+			return;
+		}
+		IRegion excOutBlock = collectHandlerRegions();
+		if (excOutBlock != null) {
+			mth.getRegion().add(excOutBlock);
+		}
+	}
+	private @Nullable IRegion collectHandlerRegions() {
+		List<TryCatchBlockAttr> tcs = mth.getAll(AType.TRY_BLOCKS_LIST);
+		for (TryCatchBlockAttr tc : tcs) {
+			List<BlockNode> blocks = new ArrayList<>(tc.getHandlersCount());
+			Set<BlockNode> splitters = new HashSet<>();
+			for (ExceptionHandler handler : tc.getHandlers()) {
+				BlockNode handlerBlock = handler.getHandlerBlock();
+				if (handlerBlock != null) {
+					blocks.add(handlerBlock);
+					splitters.add(BlockUtils.getTopSplitterForHandler(handlerBlock));
+				} else {
+					mth.addDebugComment("No exception handler block: " + handler);
+				}
+			}
+			Set<BlockNode> exits = new HashSet<>();
+			for (BlockNode splitter : splitters) {
+				for (BlockNode handler : blocks) {
+					if (handler.contains(AFlag.REMOVE)) {
+						continue;
+					}
+					List<BlockNode> s = splitter.getSuccessors();
+					if (s.isEmpty()) {
+						mth.addDebugComment("No successors for splitter: " + splitter);
+						continue;
+					}
+					BlockNode ss = s.get(0);
+					BlockNode cross = BlockUtils.getPathCross(mth, ss, handler);
+					if (cross != null && cross != ss && cross != handler) {
+						exits.add(cross);
+					}
+				}
+			}
+			for (ExceptionHandler handler : tc.getHandlers()) {
+				processExcHandler(handler, exits);
+			}
+		}
+		return processHandlersOutBlocks(tcs);
+	}
+	private @Nullable IRegion processHandlersOutBlocks(List<TryCatchBlockAttr> tcs) {
+		Set<IBlock> allRegionBlocks = new HashSet<>();
+		RegionUtils.getAllRegionBlocks(mth.getRegion(), allRegionBlocks);
+		Set<IBlock> successorBlocks = new HashSet<>();
+		for (TryCatchBlockAttr tc : tcs) {
+			for (ExceptionHandler handler : tc.getHandlers()) {
+				IContainer region = handler.getHandlerRegion();
+				if (region != null) {
+					IBlock lastBlock = RegionUtils.getLastBlock(region);
+					if (lastBlock instanceof BlockNode) {
+						successorBlocks.addAll(((BlockNode) lastBlock).getSuccessors());
+					}
+					RegionUtils.getAllRegionBlocks(region, allRegionBlocks);
+				}
+			}
+		}
+		successorBlocks.removeAll(allRegionBlocks);
+		if (successorBlocks.isEmpty()) {
+			return null;
+		}
+		RegionStack stack = regionMaker.getStack();
+		Region excOutRegion = new Region(mth.getRegion());
+		for (IBlock block : successorBlocks) {
+			if (block instanceof BlockNode) {
+				stack.clear();
+				stack.push(excOutRegion);
+				excOutRegion.add(regionMaker.makeRegion((BlockNode) block));
+			}
+		}
+		return excOutRegion;
+	}
+	private void processExcHandler(ExceptionHandler handler, Set<BlockNode> exits) {
+		BlockNode start = handler.getHandlerBlock();
+		if (start == null) {
+			return;
+		}
+		RegionStack stack = regionMaker.getStack().clear();
+		BlockNode dom;
+		if (handler.isFinally()) {
+			dom = BlockUtils.getTopSplitterForHandler(start);
+		} else {
+			dom = start;
+			stack.addExits(exits);
+		}
+		if (dom.contains(AFlag.REMOVE)) {
+			return;
+		}
+		BitSet domFrontier = dom.getDomFrontier();
+		List<BlockNode> handlerExits = BlockUtils.bitSetToBlocks(mth, domFrontier);
+		boolean inLoop = mth.getLoopForBlock(start) != null;
+		for (BlockNode exit : handlerExits) {
+			if ((!inLoop || BlockUtils.isPathExists(start, exit))
+					&& RegionUtils.isRegionContainsBlock(mth.getRegion(), exit)) {
+				stack.addExit(exit);
+			}
+		}
+		handler.setHandlerRegion(regionMaker.makeRegion(start));
+		ExcHandlerAttr excHandlerAttr = start.get(AType.EXC_HANDLER);
+		if (excHandlerAttr == null) {
+			mth.addWarn("Missing exception handler attribute for start block: " + start);
+		} else {
+			handler.getHandlerRegion().addAttr(excHandlerAttr);
+		}
+	}
+}
+______
+package jadx.core.dex.visitors.regions.maker;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import jadx.core.Consts;
+import jadx.core.dex.attributes.AFlag;
+import jadx.core.dex.attributes.AType;
+import jadx.core.dex.attributes.nodes.EdgeInsnAttr;
+import jadx.core.dex.attributes.nodes.LoopInfo;
+import jadx.core.dex.instructions.IfNode;
+import jadx.core.dex.instructions.InsnType;
+import jadx.core.dex.instructions.args.InsnArg;
+import jadx.core.dex.instructions.args.RegisterArg;
+import jadx.core.dex.nodes.BlockNode;
+import jadx.core.dex.nodes.IRegion;
+import jadx.core.dex.nodes.InsnNode;
+import jadx.core.dex.nodes.MethodNode;
+import jadx.core.dex.regions.Region;
+import jadx.core.dex.regions.conditions.IfCondition;
+import jadx.core.dex.regions.conditions.IfInfo;
+import jadx.core.dex.regions.conditions.IfRegion;
+import jadx.core.dex.regions.loops.LoopRegion;
+import jadx.core.utils.BlockUtils;
+import jadx.core.utils.exceptions.JadxRuntimeException;
+import static jadx.core.utils.BlockUtils.isEqualPaths;
+import static jadx.core.utils.BlockUtils.isEqualReturnBlocks;
+import static jadx.core.utils.BlockUtils.isPathExists;
+final class IfRegionMaker {
+	private static final Logger LOG = LoggerFactory.getLogger(IfRegionMaker.class);
+	private final MethodNode mth;
+	private final RegionMaker regionMaker;
+	IfRegionMaker(MethodNode mth, RegionMaker regionMaker) {
+		this.mth = mth;
+		this.regionMaker = regionMaker;
+	}
+	BlockNode process(IRegion currentRegion, BlockNode block, IfNode ifnode, RegionStack stack) {
+		if (block.contains(AFlag.ADDED_TO_REGION)) {
+			return ifnode.getThenBlock();
+		}
+		IfInfo currentIf = makeIfInfo(mth, block);
+		if (currentIf == null) {
+			return null;
+		}
+		IfInfo mergedIf = mergeNestedIfNodes(currentIf);
+		if (mergedIf != null) {
+			currentIf = mergedIf;
+		} else {
+			currentIf = IfInfo.invert(currentIf);
+		}
+		IfInfo modifiedIf = restructureIf(mth, block, currentIf);
+		if (modifiedIf != null) {
+			currentIf = modifiedIf;
+		} else {
+			if (currentIf.getMergedBlocks().size() <= 1) {
+				return null;
+			}
+			currentIf = makeIfInfo(mth, block);
+			currentIf = restructureIf(mth, block, currentIf);
+			if (currentIf == null) {
+				return null;
+			}
+		}
+		confirmMerge(currentIf);
+		IfRegion ifRegion = new IfRegion(currentRegion);
+		ifRegion.updateCondition(currentIf);
+		currentRegion.getSubBlocks().add(ifRegion);
+		BlockNode outBlock = currentIf.getOutBlock();
+		stack.push(ifRegion);
+		stack.addExit(outBlock);
+		BlockNode thenBlock = currentIf.getThenBlock();
+		if (thenBlock == null) {
+			ifRegion.setThenRegion(new Region(ifRegion));
+		} else {
+			ifRegion.setThenRegion(regionMaker.makeRegion(thenBlock));
+		}
+		BlockNode elseBlock = currentIf.getElseBlock();
+		if (elseBlock == null || stack.containsExit(elseBlock)) {
+			ifRegion.setElseRegion(null);
+		} else {
+			ifRegion.setElseRegion(regionMaker.makeRegion(elseBlock));
+		}
+		if (ifRegion.getElseRegion() == null && outBlock != null) {
+			List<EdgeInsnAttr> edgeInsnAttrs = outBlock.getAll(AType.EDGE_INSN);
+			if (!edgeInsnAttrs.isEmpty()) {
+				Region elseRegion = new Region(ifRegion);
+				for (EdgeInsnAttr edgeInsnAttr : edgeInsnAttrs) {
+					if (edgeInsnAttr.getEnd().equals(outBlock)) {
+						addEdgeInsn(currentIf, elseRegion, edgeInsnAttr);
+					}
+				}
+				ifRegion.setElseRegion(elseRegion);
+			}
+		}
+		stack.pop();
+		return outBlock;
+	}
+	@NotNull
+	IfInfo buildIfInfo(LoopRegion loopRegion) {
+		IfInfo condInfo = makeIfInfo(mth, loopRegion.getHeader());
+		condInfo = searchNestedIf(condInfo);
+		confirmMerge(condInfo);
+		return condInfo;
+	}
+	private void addEdgeInsn(IfInfo ifInfo, Region region, EdgeInsnAttr edgeInsnAttr) {
+		BlockNode start = edgeInsnAttr.getStart();
+		boolean fromThisIf = false;
+		for (BlockNode ifBlock : ifInfo.getMergedBlocks()) {
+			if (ifBlock.getSuccessors().contains(start)) {
+				fromThisIf = true;
+				break;
+			}
+		}
+		if (!fromThisIf) {
+			return;
+		}
+		region.add(start);
+	}
+	@Nullable
+	static IfInfo makeIfInfo(MethodNode mth, BlockNode ifBlock) {
+		InsnNode lastInsn = BlockUtils.getLastInsn(ifBlock);
+		if (lastInsn == null || lastInsn.getType() != InsnType.IF) {
+			return null;
+		}
+		IfNode ifNode = (IfNode) lastInsn;
+		IfCondition condition = IfCondition.fromIfNode(ifNode);
+		IfInfo info = new IfInfo(mth, condition, ifNode.getThenBlock(), ifNode.getElseBlock());
+		info.getMergedBlocks().add(ifBlock);
+		return info;
+	}
+	static IfInfo searchNestedIf(IfInfo info) {
+		IfInfo next = mergeNestedIfNodes(info);
+		if (next != null) {
+			return next;
+		}
+		return info;
+	}
+	static IfInfo restructureIf(MethodNode mth, BlockNode block, IfInfo info) {
+		BlockNode thenBlock = info.getThenBlock();
+		BlockNode elseBlock = info.getElseBlock();
+		if (Objects.equals(thenBlock, elseBlock)) {
+			IfInfo ifInfo = new IfInfo(info, null, null);
+			ifInfo.setOutBlock(thenBlock);
+			return ifInfo;
+		}
+		if (thenBlock.contains(AFlag.RETURN) && elseBlock.contains(AFlag.RETURN)) {
+			info.setOutBlock(null);
+			return info;
+		}
+		info.setOutBlock(BlockUtils.getPathCross(mth, thenBlock, elseBlock));
+		boolean badThen = isBadBranchBlock(info, thenBlock);
+		boolean badElse = isBadBranchBlock(info, elseBlock);
+		if (badThen && badElse) {
+			if (Consts.DEBUG_RESTRUCTURE) {
+				LOG.debug("Stop processing blocks after 'if': {}, method: {}", info.getMergedBlocks(), mth);
+			}
+			return null;
+		}
+		if (badElse) {
+			info = new IfInfo(info, thenBlock, null);
+			info.setOutBlock(elseBlock);
+		} else if (badThen) {
+			info = IfInfo.invert(info);
+			info = new IfInfo(info, elseBlock, null);
+			info.setOutBlock(thenBlock);
+		}
+		if (BlockUtils.isBackEdge(block, info.getOutBlock())) {
+			info.setOutBlock(null);
+		}
+		return info;
+	}
+	private static boolean isBadBranchBlock(IfInfo info, BlockNode block) {
+		if (block.contains(AFlag.LOOP_START) && block.getPredecessors().size() == 1) {
+			BlockNode pred = block.getPredecessors().get(0);
+			if (pred.contains(AFlag.LOOP_END)) {
+				List<LoopInfo> startLoops = block.getAll(AType.LOOP);
+				List<LoopInfo> endLoops = pred.getAll(AType.LOOP);
+				for (LoopInfo startLoop : startLoops) {
+					for (LoopInfo endLoop : endLoops) {
+						if (startLoop == endLoop) {
+							return true;
+						}
+					}
+				}
+			}
+		}
+		if (info.getOutBlock() != null) {
+			return block == info.getOutBlock();
+		}
+		return !allPathsFromIf(block, info);
+	}
+	private static boolean allPathsFromIf(BlockNode block, IfInfo info) {
+		List<BlockNode> preds = block.getPredecessors();
+		List<BlockNode> ifBlocks = info.getMergedBlocks();
+		for (BlockNode pred : preds) {
+			if (pred.contains(AFlag.LOOP_END)) {
+				continue;
+			}
+			BlockNode top = BlockUtils.skipSyntheticPredecessor(pred);
+			if (!ifBlocks.contains(top)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	static IfInfo mergeNestedIfNodes(IfInfo currentIf) {
+		BlockNode curThen = currentIf.getThenBlock();
+		BlockNode curElse = currentIf.getElseBlock();
+		if (curThen == curElse) {
+			return null;
+		}
+		if (BlockUtils.isFollowBackEdge(curThen)
+				|| BlockUtils.isFollowBackEdge(curElse)) {
+			return null;
+		}
+		boolean followThenBranch;
+		IfInfo nextIf = getNextIf(currentIf, curThen);
+		if (nextIf != null) {
+			followThenBranch = true;
+		} else {
+			nextIf = getNextIf(currentIf, curElse);
+			if (nextIf != null) {
+				followThenBranch = false;
+			} else {
+				return null;
+			}
+		}
+		boolean assignInlineNeeded = !nextIf.getForceInlineInsns().isEmpty();
+		if (assignInlineNeeded) {
+			for (BlockNode mergedBlock : currentIf.getMergedBlocks()) {
+				if (mergedBlock.contains(AFlag.LOOP_START)) {
+					return currentIf;
+				}
+			}
+		}
+		if (isInversionNeeded(currentIf, nextIf)) {
+			nextIf = IfInfo.invert(nextIf);
+		}
+		boolean thenPathSame = isEqualPaths(curThen, nextIf.getThenBlock());
+		boolean elsePathSame = isEqualPaths(curElse, nextIf.getElseBlock());
+		if (!thenPathSame && !elsePathSame) {
+			if (checkConditionBranches(curThen, curElse)
+					|| checkConditionBranches(curElse, curThen)) {
+				return null;
+			}
+			BlockNode otherBranchBlock = followThenBranch ? curElse : curThen;
+			otherBranchBlock = BlockUtils.followEmptyPath(otherBranchBlock);
+			if (!isPathExists(nextIf.getFirstIfBlock(), otherBranchBlock)) {
+				return checkForTernaryInCondition(currentIf);
+			}
+			IfInfo tmpIf = mergeNestedIfNodes(nextIf);
+			if (tmpIf != null) {
+				nextIf = tmpIf;
+				if (isInversionNeeded(currentIf, nextIf)) {
+					nextIf = IfInfo.invert(nextIf);
+				}
+				if (!canMerge(currentIf, nextIf, followThenBranch)) {
+					return currentIf;
+				}
+			} else {
+				return currentIf;
+			}
+		} else {
+			if (assignInlineNeeded) {
+				boolean sameOuts = (thenPathSame && !followThenBranch) || (elsePathSame && followThenBranch);
+				if (!sameOuts) {
+					currentIf.resetForceInlineInsns();
+					return currentIf;
+				}
+			}
+		}
+		IfInfo result = mergeIfInfo(currentIf, nextIf, followThenBranch);
+		return searchNestedIf(result);
+	}
+	private static IfInfo checkForTernaryInCondition(IfInfo currentIf) {
+		IfInfo nextThen = getNextIf(currentIf, currentIf.getThenBlock());
+		IfInfo nextElse = getNextIf(currentIf, currentIf.getElseBlock());
+		if (nextThen == null || nextElse == null) {
+			return null;
+		}
+		if (!nextThen.getFirstIfBlock().getDomFrontier().equals(nextElse.getFirstIfBlock().getDomFrontier())) {
+			return null;
+		}
+		nextThen = searchNestedIf(nextThen);
+		nextElse = searchNestedIf(nextElse);
+		if (nextThen.getThenBlock() == nextElse.getThenBlock()
+				&& nextThen.getElseBlock() == nextElse.getElseBlock()) {
+			return mergeTernaryConditions(currentIf, nextThen, nextElse);
+		}
+		if (nextThen.getThenBlock() == nextElse.getElseBlock()
+				&& nextThen.getElseBlock() == nextElse.getThenBlock()) {
+			nextElse = IfInfo.invert(nextElse);
+			return mergeTernaryConditions(currentIf, nextThen, nextElse);
+		}
+		return null;
+	}
+	private static IfInfo mergeTernaryConditions(IfInfo currentIf, IfInfo nextThen, IfInfo nextElse) {
+		IfCondition newCondition = IfCondition.ternary(currentIf.getCondition(),
+				nextThen.getCondition(), nextElse.getCondition());
+		IfInfo result = new IfInfo(currentIf.getMth(), newCondition, nextThen.getThenBlock(), nextThen.getElseBlock());
+		result.merge(currentIf, nextThen, nextElse);
+		confirmMerge(result);
+		return result;
+	}
+	private static boolean isInversionNeeded(IfInfo currentIf, IfInfo nextIf) {
+		return isEqualPaths(currentIf.getElseBlock(), nextIf.getThenBlock())
+				|| isEqualPaths(currentIf.getThenBlock(), nextIf.getElseBlock());
+	}
+	private static boolean canMerge(IfInfo a, IfInfo b, boolean followThenBranch) {
+		if (followThenBranch) {
+			return isEqualPaths(a.getElseBlock(), b.getElseBlock());
+		} else {
+			return isEqualPaths(a.getThenBlock(), b.getThenBlock());
+		}
+	}
+	private static boolean checkConditionBranches(BlockNode from, BlockNode to) {
+		return from.getCleanSuccessors().size() == 1 && from.getCleanSuccessors().contains(to);
+	}
+	static IfInfo mergeIfInfo(IfInfo first, IfInfo second, boolean followThenBranch) {
+		MethodNode mth = first.getMth();
+		Set<BlockNode> skipBlocks = first.getSkipBlocks();
+		BlockNode thenBlock;
+		BlockNode elseBlock;
+		if (followThenBranch) {
+			thenBlock = second.getThenBlock();
+			elseBlock = getBranchBlock(first.getElseBlock(), second.getElseBlock(), skipBlocks, mth);
+		} else {
+			thenBlock = getBranchBlock(first.getThenBlock(), second.getThenBlock(), skipBlocks, mth);
+			elseBlock = second.getElseBlock();
+		}
+		IfCondition.Mode mergeOperation = followThenBranch ? IfCondition.Mode.AND : IfCondition.Mode.OR;
+		IfCondition condition = IfCondition.merge(mergeOperation, first.getCondition(), second.getCondition());
+		IfInfo result = new IfInfo(mth, condition, thenBlock, elseBlock);
+		result.merge(first, second);
+		return result;
+	}
+	private static BlockNode getBranchBlock(BlockNode first, BlockNode second, Set<BlockNode> skipBlocks, MethodNode mth) {
+		if (first == second) {
+			return second;
+		}
+		if (isEqualReturnBlocks(first, second)) {
+			skipBlocks.add(first);
+			return second;
+		}
+		BlockNode cross = BlockUtils.getPathCross(mth, first, second);
+		if (cross != null) {
+			BlockUtils.visitBlocksOnPath(mth, first, cross, skipBlocks::add);
+			BlockUtils.visitBlocksOnPath(mth, second, cross, skipBlocks::add);
+			skipBlocks.remove(cross);
+			return cross;
+		}
+		BlockNode firstSkip = BlockUtils.followEmptyPath(first);
+		BlockNode secondSkip = BlockUtils.followEmptyPath(second);
+		if (firstSkip.equals(secondSkip) || isEqualReturnBlocks(firstSkip, secondSkip)) {
+			skipBlocks.add(first);
+			skipBlocks.add(second);
+			BlockUtils.visitBlocksOnEmptyPath(first, skipBlocks::add);
+			BlockUtils.visitBlocksOnEmptyPath(second, skipBlocks::add);
+			return secondSkip;
+		}
+		throw new JadxRuntimeException("Unexpected merge pattern");
+	}
+	static void confirmMerge(IfInfo info) {
+		if (info.getMergedBlocks().size() > 1) {
+			for (BlockNode block : info.getMergedBlocks()) {
+				if (block != info.getFirstIfBlock()) {
+					block.add(AFlag.ADDED_TO_REGION);
+				}
+			}
+		}
+		if (!info.getSkipBlocks().isEmpty()) {
+			for (BlockNode block : info.getSkipBlocks()) {
+				block.add(AFlag.ADDED_TO_REGION);
+			}
+			info.getSkipBlocks().clear();
+		}
+		for (InsnNode forceInlineInsn : info.getForceInlineInsns()) {
+			forceInlineInsn.add(AFlag.FORCE_ASSIGN_INLINE);
+		}
+	}
+	private static IfInfo getNextIf(IfInfo info, BlockNode block) {
+		if (!canSelectNext(info, block)) {
+			return null;
+		}
+		return getNextIfNodeInfo(info, block);
+	}
+	private static boolean canSelectNext(IfInfo info, BlockNode block) {
+		if (block.getPredecessors().size() == 1) {
+			return true;
+		}
+		return info.getMergedBlocks().containsAll(block.getPredecessors());
+	}
+	private static IfInfo getNextIfNodeInfo(IfInfo info, BlockNode block) {
+		if (block == null || block.contains(AType.LOOP) || block.contains(AFlag.ADDED_TO_REGION)) {
+			return null;
+		}
+		InsnNode lastInsn = BlockUtils.getLastInsn(block);
+		if (lastInsn != null && lastInsn.getType() == InsnType.IF) {
+			return makeIfInfo(info.getMth(), block);
+		}
+		List<BlockNode> successors = block.getSuccessors();
+		if (successors.size() != 1) {
+			return null;
+		}
+		BlockNode next = successors.get(0);
+		if (next.getPredecessors().size() != 1) {
+			return null;
+		}
+		if (next.contains(AFlag.ADDED_TO_REGION)) {
+			return null;
+		}
+		List<InsnNode> insns = block.getInstructions();
+		boolean pass = true;
+		List<InsnNode> forceInlineInsns = new ArrayList<>();
+		if (!insns.isEmpty()) {
+			for (InsnNode insn : insns) {
+				RegisterArg res = insn.getResult();
+				if (res == null) {
+					pass = false;
+					break;
+				}
+				List<RegisterArg> useList = res.getSVar().getUseList();
+				int useCount = useList.size();
+				if (useCount == 0) {
+					pass = false;
+					break;
+				}
+				InsnArg arg = useList.get(0);
+				InsnNode usePlace = arg.getParentInsn();
+				if (!BlockUtils.blockContains(block, usePlace)
+						&& !BlockUtils.blockContains(next, usePlace)) {
+					pass = false;
+					break;
+				}
+				if (useCount > 1) {
+					forceInlineInsns.add(insn);
+				} else {
+					pass = false;
+				}
+			}
+		}
+		if (!pass) {
+			return null;
+		}
+		IfInfo nextInfo = makeIfInfo(info.getMth(), next);
+		if (nextInfo == null) {
+			return getNextIfNodeInfo(info, next);
+		}
+		nextInfo.addInsnsForForcedInline(forceInlineInsns);
+		return nextInfo;
+	}
+}
+______
+package jadx.core;
+public class Consts {
+	public static final boolean DEBUG = false;
+	public static final boolean DEBUG_WITH_ERRORS = false; 
+	public static final boolean DEBUG_USAGE = false;
+	public static final boolean DEBUG_TYPE_INFERENCE = false;
+	public static final boolean DEBUG_OVERLOADED_CASTS = false;
+	public static final boolean DEBUG_EXC_HANDLERS = false;
+	public static final boolean DEBUG_FINALLY = false;
+	public static final boolean DEBUG_ATTRIBUTES = false;
+	public static final boolean DEBUG_RESTRUCTURE = false;
+	public static final boolean DEBUG_EVENTS = Jadx.isDevVersion();
+	public static final String CLASS_OBJECT = "java.lang.Object";
+	public static final String CLASS_STRING = "java.lang.String";
+	public static final String CLASS_CLASS = "java.lang.Class";
+	public static final String CLASS_THROWABLE = "java.lang.Throwable";
+	public static final String CLASS_EXCEPTION = "java.lang.Exception";
+	public static final String CLASS_ENUM = "java.lang.Enum";
+	public static final String CLASS_STRING_BUILDER = "java.lang.StringBuilder";
+	public static final String OVERRIDE_ANNOTATION = "Ljava/lang/Override;";
+	public static final String DEFAULT_PACKAGE_NAME = "defpackage";
+	public static final String ANONYMOUS_CLASS_PREFIX = "AnonymousClass";
+	public static final String MTH_TOSTRING_SIGNATURE = "toString()Ljava/lang/String;";
+	private Consts() {
+	}
+}
+______
+package jadx.core;
+import java.io.InputStream;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Enumeration;
+import java.util.List;
+import java.util.jar.Manifest;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import jadx.api.CommentsLevel;
+import jadx.api.JadxArgs;
+import jadx.core.deobf.DeobfuscatorVisitor;
+import jadx.core.deobf.SaveDeobfMapping;
+import jadx.core.dex.attributes.AFlag;
+import jadx.core.dex.visitors.AnonymousClassVisitor;
+import jadx.core.dex.visitors.AttachCommentsVisitor;
+import jadx.core.dex.visitors.AttachMethodDetails;
+import jadx.core.dex.visitors.AttachTryCatchVisitor;
+import jadx.core.dex.visitors.CheckCode;
+import jadx.core.dex.visitors.ClassModifier;
+import jadx.core.dex.visitors.ConstInlineVisitor;
+import jadx.core.dex.visitors.ConstructorVisitor;
+import jadx.core.dex.visitors.DeboxingVisitor;
+import jadx.core.dex.visitors.DotGraphVisitor;
+import jadx.core.dex.visitors.EnumVisitor;
+import jadx.core.dex.visitors.ExtractFieldInit;
+import jadx.core.dex.visitors.FallbackModeVisitor;
+import jadx.core.dex.visitors.FixSwitchOverEnum;
+import jadx.core.dex.visitors.GenericTypesVisitor;
+import jadx.core.dex.visitors.IDexTreeVisitor;
+import jadx.core.dex.visitors.InitCodeVariables;
+import jadx.core.dex.visitors.InlineMethods;
+import jadx.core.dex.visitors.MarkMethodsForInline;
+import jadx.core.dex.visitors.MethodInvokeVisitor;
+import jadx.core.dex.visitors.MethodVisitor;
+import jadx.core.dex.visitors.ModVisitor;
+import jadx.core.dex.visitors.MoveInlineVisitor;
+import jadx.core.dex.visitors.OverrideMethodVisitor;
+import jadx.core.dex.visitors.PrepareForCodeGen;
+import jadx.core.dex.visitors.ProcessAnonymous;
+import jadx.core.dex.visitors.ProcessInstructionsVisitor;
+import jadx.core.dex.visitors.ProcessMethodsForInline;
+import jadx.core.dex.visitors.ReplaceNewArray;
+import jadx.core.dex.visitors.ShadowFieldVisitor;
+import jadx.core.dex.visitors.SignatureProcessor;
+import jadx.core.dex.visitors.SimplifyVisitor;
+import jadx.core.dex.visitors.blocks.BlockFinisher;
+import jadx.core.dex.visitors.blocks.BlockProcessor;
+import jadx.core.dex.visitors.blocks.BlockSplitter;
+import jadx.core.dex.visitors.debuginfo.DebugInfoApplyVisitor;
+import jadx.core.dex.visitors.debuginfo.DebugInfoAttachVisitor;
+import jadx.core.dex.visitors.finaly.MarkFinallyVisitor;
+import jadx.core.dex.visitors.fixaccessmodifiers.FixAccessModifiers;
+import jadx.core.dex.visitors.gradle.NonFinalResIdsVisitor;
+import jadx.core.dex.visitors.kotlin.ProcessKotlinInternals;
+import jadx.core.dex.visitors.prepare.AddAndroidConstants;
+import jadx.core.dex.visitors.prepare.CollectConstValues;
+import jadx.core.dex.visitors.regions.CheckRegions;
+import jadx.core.dex.visitors.regions.CleanRegions;
+import jadx.core.dex.visitors.regions.IfRegionVisitor;
+import jadx.core.dex.visitors.regions.LoopRegionVisitor;
+import jadx.core.dex.visitors.regions.RegionMakerVisitor;
+import jadx.core.dex.visitors.regions.ReturnVisitor;
+import jadx.core.dex.visitors.regions.SwitchOverStringVisitor;
+import jadx.core.dex.visitors.regions.variables.ProcessVariables;
+import jadx.core.dex.visitors.rename.CodeRenameVisitor;
+import jadx.core.dex.visitors.rename.RenameVisitor;
+import jadx.core.dex.visitors.rename.SourceFileRename;
+import jadx.core.dex.visitors.shrink.CodeShrinkVisitor;
+import jadx.core.dex.visitors.ssa.SSATransform;
+import jadx.core.dex.visitors.typeinference.FinishTypeInference;
+import jadx.core.dex.visitors.typeinference.FixTypesVisitor;
+import jadx.core.dex.visitors.typeinference.TypeInferenceVisitor;
+import jadx.core.dex.visitors.usage.UsageInfoVisitor;
+import jadx.core.utils.exceptions.JadxRuntimeException;
+public class Jadx {
+	private static final Logger LOG = LoggerFactory.getLogger(Jadx.class);
+	private Jadx() {
+	}
+	public static List<IDexTreeVisitor> getPassesList(JadxArgs args) {
+		switch (args.getDecompilationMode()) {
+			case AUTO:
+			case RESTRUCTURE:
+				return getRegionsModePasses(args);
+			case SIMPLE:
+				return getSimpleModePasses(args);
+			case FALLBACK:
+				return getFallbackPassesList();
+			default:
+				throw new JadxRuntimeException("Unknown decompilation mode: " + args.getDecompilationMode());
+		}
+	}
+	public static List<IDexTreeVisitor> getPreDecompilePassesList() {
+		List<IDexTreeVisitor> passes = new ArrayList<>();
+		passes.add(new SignatureProcessor());
+		passes.add(new OverrideMethodVisitor());
+		passes.add(new AddAndroidConstants());
+		passes.add(new CollectConstValues());
+		passes.add(new DeobfuscatorVisitor());
+		passes.add(new SourceFileRename());
+		passes.add(new RenameVisitor());
+		passes.add(new SaveDeobfMapping());
+		passes.add(new UsageInfoVisitor());
+		passes.add(new ProcessAnonymous());
+		passes.add(new ProcessMethodsForInline());
+		return passes;
+	}
+	public static List<IDexTreeVisitor> getRegionsModePasses(JadxArgs args) {
+		List<IDexTreeVisitor> passes = new ArrayList<>();
+		passes.add(new CheckCode());
+		if (args.isDebugInfo()) {
+			passes.add(new DebugInfoAttachVisitor());
+		}
+		passes.add(new AttachTryCatchVisitor());
+		if (args.getCommentsLevel() != CommentsLevel.NONE) {
+			passes.add(new AttachCommentsVisitor());
+		}
+		passes.add(new AttachMethodDetails());
+		passes.add(new ProcessInstructionsVisitor());
+		passes.add(new BlockSplitter());
+		passes.add(new BlockProcessor());
+		passes.add(new BlockFinisher());
+		if (args.isRawCFGOutput()) {
+			passes.add(DotGraphVisitor.dumpRaw());
+		}
+		passes.add(new SSATransform());
+		passes.add(new MoveInlineVisitor());
+		passes.add(new ConstructorVisitor());
+		passes.add(new InitCodeVariables());
+		if (args.isExtractFinally()) {
+			passes.add(new MarkFinallyVisitor());
+		}
+		passes.add(new ConstInlineVisitor());
+		passes.add(new TypeInferenceVisitor());
+		if (args.isDebugInfo()) {
+			passes.add(new DebugInfoApplyVisitor());
+		}
+		passes.add(new FixTypesVisitor());
+		passes.add(new FinishTypeInference());
+		if (args.getUseKotlinMethodsForVarNames() != JadxArgs.UseKotlinMethodsForVarNames.DISABLE) {
+			passes.add(new ProcessKotlinInternals());
+		}
+		passes.add(new CodeRenameVisitor());
+		if (args.isInlineMethods()) {
+			passes.add(new InlineMethods());
+		}
+		passes.add(new GenericTypesVisitor());
+		passes.add(new ShadowFieldVisitor());
+		passes.add(new DeboxingVisitor());
+		passes.add(new AnonymousClassVisitor());
+		passes.add(new ModVisitor());
+		passes.add(new CodeShrinkVisitor());
+		passes.add(new ReplaceNewArray());
+		if (args.isCfgOutput()) {
+			passes.add(DotGraphVisitor.dump());
+		}
+		passes.add(new RegionMakerVisitor());
+		passes.add(new IfRegionVisitor());
+		if (args.isRestoreSwitchOverString()) {
+			passes.add(new SwitchOverStringVisitor());
+		}
+		passes.add(new ReturnVisitor());
+		passes.add(new CleanRegions());
+		passes.add(new CodeShrinkVisitor());
+		passes.add(new MethodInvokeVisitor());
+		passes.add(new SimplifyVisitor());
+		passes.add(new CheckRegions());
+		passes.add(new EnumVisitor());
+		passes.add(new FixSwitchOverEnum());
+		passes.add(new NonFinalResIdsVisitor());
+		passes.add(new ExtractFieldInit());
+		passes.add(new FixAccessModifiers());
+		passes.add(new ClassModifier());
+		passes.add(new LoopRegionVisitor());
+		if (args.isInlineMethods()) {
+			passes.add(new MarkMethodsForInline());
+		}
+		passes.add(new ProcessVariables());
+		passes.add(new PrepareForCodeGen());
+		if (args.isCfgOutput()) {
+			passes.add(DotGraphVisitor.dumpRegions());
+		}
+		return passes;
+	}
+	public static List<IDexTreeVisitor> getSimpleModePasses(JadxArgs args) {
+		List<IDexTreeVisitor> passes = new ArrayList<>();
+		if (args.isDebugInfo()) {
+			passes.add(new DebugInfoAttachVisitor());
+		}
+		passes.add(new AttachTryCatchVisitor());
+		if (args.getCommentsLevel() != CommentsLevel.NONE) {
+			passes.add(new AttachCommentsVisitor());
+		}
+		passes.add(new AttachMethodDetails());
+		passes.add(new ProcessInstructionsVisitor());
+		passes.add(new BlockSplitter());
+		if (args.isRawCFGOutput()) {
+			passes.add(DotGraphVisitor.dumpRaw());
+		}
+		passes.add(new MethodVisitor("DisableBlockLock", mth -> mth.add(AFlag.DISABLE_BLOCKS_LOCK)));
+		passes.add(new BlockProcessor());
+		passes.add(new SSATransform());
+		passes.add(new MoveInlineVisitor());
+		passes.add(new ConstructorVisitor());
+		passes.add(new InitCodeVariables());
+		passes.add(new ConstInlineVisitor());
+		passes.add(new TypeInferenceVisitor());
+		if (args.isDebugInfo()) {
+			passes.add(new DebugInfoApplyVisitor());
+		}
+		passes.add(new FixTypesVisitor());
+		passes.add(new FinishTypeInference());
+		passes.add(new CodeRenameVisitor());
+		passes.add(new DeboxingVisitor());
+		passes.add(new ModVisitor());
+		passes.add(new CodeShrinkVisitor());
+		passes.add(new ReplaceNewArray());
+		passes.add(new SimplifyVisitor());
+		passes.add(new MethodVisitor("ForceGenerateAll", mth -> mth.remove(AFlag.DONT_GENERATE)));
+		if (args.isCfgOutput()) {
+			passes.add(DotGraphVisitor.dump());
+		}
+		return passes;
+	}
+	public static List<IDexTreeVisitor> getFallbackPassesList() {
+		List<IDexTreeVisitor> passes = new ArrayList<>();
+		passes.add(new AttachTryCatchVisitor());
+		passes.add(new AttachCommentsVisitor());
+		passes.add(new ProcessInstructionsVisitor());
+		passes.add(new FallbackModeVisitor());
+		return passes;
+	}
+	public static final String VERSION_DEV = "dev";
+	private static String version;
+	public static String getVersion() {
+		if (version == null) {
+			version = searchJadxVersion();
+		}
+		return version;
+	}
+	public static boolean isDevVersion() {
+		return getVersion().equals(VERSION_DEV);
+	}
+	private static String searchJadxVersion() {
+		try {
+			ClassLoader classLoader = Jadx.class.getClassLoader();
+			if (classLoader != null) {
+				Enumeration<URL> resources = classLoader.getResources("META-INF/MANIFEST.MF");
+				while (resources.hasMoreElements()) {
+					try (InputStream is = resources.nextElement().openStream()) {
+						Manifest manifest = new Manifest(is);
+						String ver = manifest.getMainAttributes().getValue("jadx-version");
+						if (ver != null) {
+							return ver;
+						}
+					}
+				}
+			}
+		} catch (Exception e) {
+			LOG.error("Can't get manifest file", e);
+		}
+		return VERSION_DEV;
+	}
+}
+______
+package jadx.core.dex.visitors.regions;
+import jadx.core.dex.attributes.AFlag;
+import jadx.core.dex.nodes.MethodNode;
+import jadx.core.dex.visitors.AbstractVisitor;
+import jadx.core.dex.visitors.JadxVisitor;
+import jadx.core.dex.visitors.regions.maker.ExcHandlersRegionMaker;
+import jadx.core.dex.visitors.regions.maker.RegionMaker;
+import jadx.core.dex.visitors.regions.maker.SynchronizedRegionMaker;
+import jadx.core.dex.visitors.shrink.CodeShrinkVisitor;
+import jadx.core.utils.exceptions.JadxException;
+@JadxVisitor(
+		name = "RegionMakerVisitor",
+		desc = "Pack blocks into regions for code generation"
+)
+public class RegionMakerVisitor extends AbstractVisitor {
+	@Override
+	public void visit(MethodNode mth) throws JadxException {
+		if (mth.isNoCode() || mth.getBasicBlocks().isEmpty()) {
+			return;
+		}
+		RegionMaker rm = new RegionMaker(mth);
+		mth.setRegion(rm.makeMthRegion());
+		if (!mth.isNoExceptionHandlers()) {
+			new ExcHandlersRegionMaker(mth, rm).process();
+		}
+		processForceInlineInsns(mth);
+		ProcessTryCatchRegions.process(mth);
+		PostProcessRegions.process(mth);
+		CleanRegions.process(mth);
+		if (mth.getAccessFlags().isSynchronized()) {
+			SynchronizedRegionMaker.removeSynchronized(mth);
+		}
+	}
+	private static void processForceInlineInsns(MethodNode mth) {
+		boolean needShrink = mth.getBasicBlocks().stream()
+				.flatMap(block -> block.getInstructions().stream())
+				.anyMatch(insn -> insn.contains(AFlag.FORCE_ASSIGN_INLINE));
+		if (needShrink) {
+			CodeShrinkVisitor.shrinkMethod(mth);
+		}
+	}
+	@Override
+	public String getName() {
+		return "RegionMakerVisitor";
+	}
+}
+______
+package jadx.core.dex.visitors.regions.maker;
+import java.util.ArrayList;
+import java.util.BitSet;
+import java.util.List;
+import java.util.Objects;
+import jadx.core.dex.attributes.AFlag;
+import jadx.core.dex.attributes.AType;
+import jadx.core.dex.attributes.nodes.EdgeInsnAttr;
+import jadx.core.dex.attributes.nodes.LoopInfo;
+import jadx.core.dex.instructions.IfNode;
+import jadx.core.dex.instructions.InsnType;
+import jadx.core.dex.instructions.SwitchInsn;
+import jadx.core.dex.nodes.BlockNode;
+import jadx.core.dex.nodes.IRegion;
+import jadx.core.dex.nodes.InsnContainer;
+import jadx.core.dex.nodes.InsnNode;
+import jadx.core.dex.nodes.MethodNode;
+import jadx.core.dex.regions.Region;
+import jadx.core.utils.BlockUtils;
+import jadx.core.utils.exceptions.JadxOverflowException;
+import static jadx.core.utils.BlockUtils.getNextBlock;
+public class RegionMaker {
+	private final MethodNode mth;
+	private final RegionStack stack;
+	private final IfRegionMaker ifMaker;
+	private final LoopRegionMaker loopMaker;
+	private final BitSet processedBlocks;
+	private final int regionsLimit;
+	private int regionsCount;
+	public RegionMaker(MethodNode mth) {
+		this.mth = mth;
+		this.stack = new RegionStack(mth);
+		this.ifMaker = new IfRegionMaker(mth, this);
+		this.loopMaker = new LoopRegionMaker(mth, this, ifMaker);
+		int blocksCount = mth.getBasicBlocks().size();
+		this.processedBlocks = new BitSet(blocksCount);
+		this.regionsLimit = blocksCount * 100;
+	}
+	public Region makeMthRegion() {
+		return makeRegion(mth.getEnterBlock());
+	}
+	Region makeRegion(BlockNode startBlock) {
+		Objects.requireNonNull(startBlock);
+		Region region = new Region(stack.peekRegion());
+		if (stack.containsExit(startBlock)) {
+			insertEdgeInsns(region, startBlock);
+			return region;
+		}
+		int startBlockId = startBlock.getId();
+		if (processedBlocks.get(startBlockId)) {
+			mth.addWarn("Removed duplicated region for block: " + startBlock + ' ' + startBlock.getAttributesString());
+			return region;
+		}
+		processedBlocks.set(startBlockId);
+		BlockNode next = startBlock;
+		while (next != null) {
+			next = traverse(region, next);
+			regionsCount++;
+			if (regionsCount > regionsLimit) {
+				throw new JadxOverflowException("Regions count limit reached");
+			}
+		}
+		return region;
+	}
+	private BlockNode traverse(IRegion r, BlockNode block) {
+		if (block.contains(AFlag.MTH_EXIT_BLOCK)) {
+			return null;
+		}
+		BlockNode next = null;
+		boolean processed = false;
+		List<LoopInfo> loops = block.getAll(AType.LOOP);
+		int loopCount = loops.size();
+		if (loopCount != 0 && block.contains(AFlag.LOOP_START)) {
+			if (loopCount == 1) {
+				next = loopMaker.process(r, loops.get(0), stack);
+				processed = true;
+			} else {
+				for (LoopInfo loop : loops) {
+					if (loop.getStart() == block) {
+						next = loopMaker.process(r, loop, stack);
+						processed = true;
+						break;
+					}
+				}
+			}
+		}
+		InsnNode insn = BlockUtils.getLastInsn(block);
+		if (!processed && insn != null) {
+			switch (insn.getType()) {
+				case IF:
+					next = ifMaker.process(r, block, (IfNode) insn, stack);
+					processed = true;
+					break;
+				case SWITCH:
+					SwitchRegionMaker switchMaker = new SwitchRegionMaker(mth, this);
+					next = switchMaker.process(r, block, (SwitchInsn) insn, stack);
+					processed = true;
+					break;
+				case MONITOR_ENTER:
+					SynchronizedRegionMaker syncMaker = new SynchronizedRegionMaker(mth, this);
+					next = syncMaker.process(r, block, insn, stack);
+					processed = true;
+					break;
+			}
+		}
+		if (!processed) {
+			r.getSubBlocks().add(block);
+			next = getNextBlock(block);
+		}
+		if (next != null && !stack.containsExit(block) && !stack.containsExit(next)) {
+			return next;
+		}
+		return null;
+	}
+	private void insertEdgeInsns(Region region, BlockNode exitBlock) {
+		List<EdgeInsnAttr> edgeInsns = exitBlock.getAll(AType.EDGE_INSN);
+		if (edgeInsns.isEmpty()) {
+			return;
+		}
+		List<InsnNode> insns = new ArrayList<>(edgeInsns.size());
+		addOneInsnOfType(insns, edgeInsns, InsnType.BREAK);
+		addOneInsnOfType(insns, edgeInsns, InsnType.CONTINUE);
+		region.add(new InsnContainer(insns));
+	}
+	private void addOneInsnOfType(List<InsnNode> insns, List<EdgeInsnAttr> edgeInsns, InsnType insnType) {
+		for (EdgeInsnAttr edgeInsn : edgeInsns) {
+			InsnNode insn = edgeInsn.getInsn();
+			if (insn.getType() == insnType) {
+				insns.add(insn);
+				return;
+			}
+		}
+	}
+	RegionStack getStack() {
+		return stack;
+	}
+	boolean isProcessed(BlockNode block) {
+		return processedBlocks.get(block.getId());
+	}
+	void clearBlockProcessedState(BlockNode block) {
+		processedBlocks.clear(block.getId());
+	}
+}

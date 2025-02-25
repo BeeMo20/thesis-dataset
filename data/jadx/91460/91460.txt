@@ -1,0 +1,1048 @@
+SEVERITY = 4
+
+package jadx.core.dex.visitors.regions;
+import java.util.HashSet;
+import java.util.Set;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import jadx.api.ICodeWriter;
+import jadx.api.impl.SimpleCodeWriter;
+import jadx.core.Consts;
+import jadx.core.codegen.InsnGen;
+import jadx.core.codegen.MethodGen;
+import jadx.core.dex.attributes.AFlag;
+import jadx.core.dex.attributes.AType;
+import jadx.core.dex.nodes.BlockNode;
+import jadx.core.dex.nodes.IBlock;
+import jadx.core.dex.nodes.IRegion;
+import jadx.core.dex.nodes.InsnNode;
+import jadx.core.dex.nodes.MethodNode;
+import jadx.core.dex.regions.loops.LoopRegion;
+import jadx.core.dex.visitors.AbstractVisitor;
+import jadx.core.utils.exceptions.CodegenException;
+import jadx.core.utils.exceptions.JadxException;
+public class CheckRegions extends AbstractVisitor {
+	private static final Logger LOG = LoggerFactory.getLogger(CheckRegions.class);
+	@Override
+	public void visit(MethodNode mth) throws JadxException {
+		if (mth.isNoCode()
+				|| mth.getRegion() == null
+				|| mth.getBasicBlocks().isEmpty()
+				|| mth.contains(AType.JADX_ERROR)) {
+			return;
+		}
+		Set<BlockNode> blocksInRegions = new HashSet<>();
+		DepthRegionTraversal.traverse(mth, new AbstractRegionVisitor() {
+			@Override
+			public void processBlock(MethodNode mth, IBlock container) {
+				if (!(container instanceof BlockNode)) {
+					return;
+				}
+				BlockNode block = (BlockNode) container;
+				if (blocksInRegions.add(block)) {
+					return;
+				}
+				if (Consts.DEBUG_RESTRUCTURE
+						&& LOG.isDebugEnabled()
+						&& !block.contains(AFlag.RETURN)
+						&& !block.contains(AFlag.REMOVE)
+						&& !block.contains(AFlag.SYNTHETIC)
+						&& !block.getInstructions().isEmpty()) {
+					LOG.debug("Duplicated block: {} - {}", mth, block);
+				}
+			}
+		});
+		if (mth.getBasicBlocks().size() != blocksInRegions.size()) {
+			for (BlockNode block : mth.getBasicBlocks()) {
+				if (!blocksInRegions.contains(block)
+						&& !block.getInstructions().isEmpty()
+						&& !block.contains(AFlag.ADDED_TO_REGION)
+						&& !block.contains(AFlag.DONT_GENERATE)
+						&& !block.contains(AFlag.REMOVE)) {
+					String blockCode = getBlockInsnStr(mth, block).replace("*/", "*\\/");
+					mth.addWarn("Code restructure failed: missing block: " + block + ", code lost:" + blockCode);
+				}
+			}
+		}
+		DepthRegionTraversal.traverse(mth, new AbstractRegionVisitor() {
+			@Override
+			public boolean enterRegion(MethodNode mth, IRegion region) {
+				if (region instanceof LoopRegion) {
+					BlockNode loopHeader = ((LoopRegion) region).getHeader();
+					if (loopHeader != null && loopHeader.getInstructions().size() != 1) {
+						mth.addWarn("Incorrect condition in loop: " + loopHeader);
+					}
+				}
+				return true;
+			}
+		});
+	}
+	private static String getBlockInsnStr(MethodNode mth, IBlock block) {
+		ICodeWriter code = new SimpleCodeWriter();
+		code.incIndent();
+		code.newLine();
+		MethodGen mg = MethodGen.getFallbackMethodGen(mth);
+		InsnGen ig = new InsnGen(mg, true);
+		for (InsnNode insn : block.getInstructions()) {
+			try {
+				ig.makeInsn(insn, code);
+			} catch (CodegenException e) {
+			}
+		}
+		code.newLine();
+		return code.getCodeStr();
+	}
+}
+_____
+package jadx.core.dex.visitors;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+import org.jetbrains.annotations.Nullable;
+import jadx.api.plugins.input.data.AccessFlags;
+import jadx.core.codegen.TypeGen;
+import jadx.core.deobf.NameMapper;
+import jadx.core.dex.attributes.AFlag;
+import jadx.core.dex.attributes.AType;
+import jadx.core.dex.attributes.nodes.EnumClassAttr;
+import jadx.core.dex.attributes.nodes.EnumClassAttr.EnumField;
+import jadx.core.dex.attributes.nodes.RenameReasonAttr;
+import jadx.core.dex.attributes.nodes.SkipMethodArgsAttr;
+import jadx.core.dex.info.AccessInfo;
+import jadx.core.dex.info.ClassInfo;
+import jadx.core.dex.info.FieldInfo;
+import jadx.core.dex.info.MethodInfo;
+import jadx.core.dex.instructions.IndexInsnNode;
+import jadx.core.dex.instructions.InsnType;
+import jadx.core.dex.instructions.InvokeNode;
+import jadx.core.dex.instructions.InvokeType;
+import jadx.core.dex.instructions.args.ArgType;
+import jadx.core.dex.instructions.args.InsnArg;
+import jadx.core.dex.instructions.args.InsnWrapArg;
+import jadx.core.dex.instructions.args.RegisterArg;
+import jadx.core.dex.instructions.args.SSAVar;
+import jadx.core.dex.instructions.mods.ConstructorInsn;
+import jadx.core.dex.nodes.BlockNode;
+import jadx.core.dex.nodes.ClassNode;
+import jadx.core.dex.nodes.FieldNode;
+import jadx.core.dex.nodes.IContainer;
+import jadx.core.dex.nodes.InsnNode;
+import jadx.core.dex.nodes.MethodNode;
+import jadx.core.dex.nodes.RootNode;
+import jadx.core.dex.regions.Region;
+import jadx.core.dex.visitors.regions.CheckRegions;
+import jadx.core.dex.visitors.regions.IfRegionVisitor;
+import jadx.core.dex.visitors.shrink.CodeShrinkVisitor;
+import jadx.core.utils.BlockInsnPair;
+import jadx.core.utils.BlockUtils;
+import jadx.core.utils.InsnRemover;
+import jadx.core.utils.InsnUtils;
+import jadx.core.utils.Utils;
+import jadx.core.utils.exceptions.JadxException;
+import jadx.core.utils.exceptions.JadxRuntimeException;
+import static jadx.core.utils.InsnUtils.checkInsnType;
+import static jadx.core.utils.InsnUtils.getSingleArg;
+import static jadx.core.utils.InsnUtils.getWrappedInsn;
+@JadxVisitor(
+		name = "EnumVisitor",
+		desc = "Restore enum classes",
+		runAfter = {
+				CodeShrinkVisitor.class, 
+				ModVisitor.class,
+				ReplaceNewArray.class, 
+				IfRegionVisitor.class, 
+				CheckRegions.class 
+		},
+		runBefore = {
+				ExtractFieldInit.class
+		}
+)
+public class EnumVisitor extends AbstractVisitor {
+	private MethodInfo enumValueOfMth;
+	private MethodInfo cloneMth;
+	@Override
+	public void init(RootNode root) {
+		enumValueOfMth = MethodInfo.fromDetails(
+				root,
+				ClassInfo.fromType(root, ArgType.ENUM),
+				"valueOf",
+				Arrays.asList(ArgType.CLASS, ArgType.STRING),
+				ArgType.ENUM);
+		cloneMth = MethodInfo.fromDetails(root,
+				ClassInfo.fromType(root, ArgType.OBJECT),
+				"clone",
+				Collections.emptyList(),
+				ArgType.OBJECT);
+	}
+	@Override
+	public boolean visit(ClassNode cls) throws JadxException {
+		if (cls.isEnum()) {
+			boolean converted;
+			try {
+				converted = convertToEnum(cls);
+			} catch (Exception e) {
+				cls.addWarnComment("Enum visitor error", e);
+				converted = false;
+			}
+			if (!converted) {
+				AccessInfo accessFlags = cls.getAccessFlags();
+				if (accessFlags.isEnum()) {
+					cls.setAccessFlags(accessFlags.remove(AccessFlags.ENUM));
+					cls.addWarnComment("Failed to restore enum class, 'enum' modifier and super class removed");
+				}
+			}
+		}
+		return true;
+	}
+	private boolean convertToEnum(ClassNode cls) {
+		ArgType superType = cls.getSuperClass();
+		if (superType != null && superType.getObject().equals(ArgType.ENUM.getObject())) {
+			cls.add(AFlag.REMOVE_SUPER_CLASS);
+		}
+		MethodNode classInitMth = cls.getClassInitMth();
+		if (classInitMth == null) {
+			cls.addWarnComment("Enum class init method not found");
+			return false;
+		}
+		Region staticRegion = classInitMth.getRegion();
+		if (staticRegion == null || classInitMth.getBasicBlocks().isEmpty()) {
+			return false;
+		}
+		List<BlockNode> staticBlocks = new ArrayList<>();
+		for (IContainer subBlock : staticRegion.getSubBlocks()) {
+			if (subBlock instanceof BlockNode) {
+				staticBlocks.add((BlockNode) subBlock);
+			} else {
+				break;
+			}
+		}
+		if (staticBlocks.isEmpty()) {
+			cls.addWarnComment("Unexpected branching in enum static init block");
+			return false;
+		}
+		EnumData data = new EnumData(cls, classInitMth, staticBlocks);
+		if (!searchValuesField(data)) {
+			return false;
+		}
+		List<EnumField> enumFields = null;
+		InsnArg arrArg = data.valuesInitInsn.getArg(0);
+		if (arrArg.isInsnWrap()) {
+			InsnNode wrappedInsn = ((InsnWrapArg) arrArg).getWrapInsn();
+			enumFields = extractEnumFieldsFromInsn(data, wrappedInsn);
+		}
+		if (enumFields == null) {
+			cls.addWarnComment("Unknown enum class pattern. Please report as an issue!");
+			return false;
+		}
+		data.toRemove.add(data.valuesInitInsn);
+		EnumClassAttr attr = new EnumClassAttr(enumFields);
+		attr.setStaticMethod(classInitMth);
+		cls.addAttr(attr);
+		for (EnumField enumField : attr.getFields()) {
+			ConstructorInsn co = enumField.getConstrInsn();
+			FieldNode fieldNode = enumField.getField();
+			String name = getConstString(cls.root(), co.getArg(0));
+			if (name != null
+					&& !fieldNode.getAlias().equals(name)
+					&& NameMapper.isValidAndPrintable(name)
+					&& cls.root().getArgs().isRenameValid()) {
+				fieldNode.getFieldInfo().setAlias(name);
+			}
+			fieldNode.add(AFlag.DONT_GENERATE);
+			processConstructorInsn(data, enumField, classInitMth);
+		}
+		data.valuesField.add(AFlag.DONT_GENERATE);
+		InsnRemover.removeAllAndUnbind(classInitMth, data.toRemove);
+		if (classInitMth.countInsns() == 0) {
+			classInitMth.add(AFlag.DONT_GENERATE);
+		} else if (!data.toRemove.isEmpty()) {
+			CodeShrinkVisitor.shrinkMethod(classInitMth);
+		}
+		removeEnumMethods(cls, data.valuesField);
+		return true;
+	}
+	private boolean searchValuesField(EnumData data) {
+		ArgType clsType = data.cls.getClassInfo().getType();
+		List<FieldNode> valuesCandidates = data.cls.getFields().stream()
+				.filter(f -> f.getAccessFlags().isStatic())
+				.filter(f -> f.getType().isArray())
+				.filter(f -> Objects.equals(f.getType().getArrayRootElement(), clsType))
+				.collect(Collectors.toList());
+		if (valuesCandidates.isEmpty()) {
+			data.cls.addWarnComment("$VALUES field not found");
+			return false;
+		}
+		if (valuesCandidates.size() > 1) {
+			valuesCandidates.removeIf(f -> !f.getAccessFlags().isSynthetic());
+		}
+		if (valuesCandidates.size() > 1) {
+			Optional<FieldNode> valuesOpt = valuesCandidates.stream().filter(f -> f.getName().equals("$VALUES")).findAny();
+			if (valuesOpt.isPresent()) {
+				valuesCandidates.clear();
+				valuesCandidates.add(valuesOpt.get());
+			}
+		}
+		if (valuesCandidates.size() != 1) {
+			data.cls.addWarnComment("Found several \"values\" enum fields: " + valuesCandidates);
+			return false;
+		}
+		data.valuesField = valuesCandidates.get(0);
+		BlockInsnPair valuesInitPair = getValuesInitInsn(data);
+		if (valuesInitPair == null) {
+			return false;
+		}
+		data.valuesInitInsn = valuesInitPair.getInsn();
+		return true;
+	}
+	private void processConstructorInsn(EnumData data, EnumField enumField, MethodNode classInitMth) {
+		ConstructorInsn co = enumField.getConstrInsn();
+		ClassInfo enumClsInfo = co.getClassType();
+		if (!enumClsInfo.equals(data.cls.getClassInfo())) {
+			ClassNode enumCls = data.cls.root().resolveClass(enumClsInfo);
+			if (enumCls != null) {
+				processEnumCls(data.cls, enumField, enumCls);
+			}
+		}
+		MethodNode ctrMth = data.cls.root().resolveMethod(co.getCallMth());
+		if (ctrMth != null) {
+			markArgsForSkip(ctrMth);
+		}
+		RegisterArg coResArg = co.getResult();
+		if (coResArg == null || coResArg.getSVar().getUseList().size() <= 2) {
+			data.toRemove.add(co);
+		} else {
+			boolean varUseFound = coResArg.getSVar().getUseList().stream()
+					.anyMatch(useArg -> !data.toRemove.contains(useArg.getParentInsn()));
+			if (varUseFound) {
+				IndexInsnNode enumGet = new IndexInsnNode(InsnType.SGET, enumField.getField().getFieldInfo(), 0);
+				enumGet.setResult(coResArg.duplicate());
+				BlockUtils.replaceInsn(classInitMth, co, enumGet);
+			}
+		}
+	}
+	@Nullable
+	private List<EnumField> extractEnumFieldsFromInsn(EnumData enumData, InsnNode wrappedInsn) {
+		switch (wrappedInsn.getType()) {
+			case FILLED_NEW_ARRAY:
+				return extractEnumFieldsFromFilledArray(enumData, wrappedInsn);
+			case INVOKE:
+				return extractEnumFieldsFromInvoke(enumData, (InvokeNode) wrappedInsn);
+			case NEW_ARRAY:
+				InsnArg arg = wrappedInsn.getArg(0);
+				if (arg.isZeroLiteral()) {
+					return Collections.emptyList();
+				}
+				return null;
+			default:
+				return null;
+		}
+	}
+	private List<EnumField> extractEnumFieldsFromInvoke(EnumData enumData, InvokeNode invokeNode) {
+		MethodInfo callMth = invokeNode.getCallMth();
+		MethodNode valuesMth = enumData.cls.root().resolveMethod(callMth);
+		if (valuesMth == null || valuesMth.isVoidReturn()) {
+			return null;
+		}
+		BlockNode returnBlock = Utils.getOne(valuesMth.getPreExitBlocks());
+		InsnNode returnInsn = BlockUtils.getLastInsn(returnBlock);
+		InsnNode wrappedInsn = getWrappedInsn(getSingleArg(returnInsn));
+		if (wrappedInsn == null) {
+			return null;
+		}
+		List<EnumField> enumFields = extractEnumFieldsFromInsn(enumData, wrappedInsn);
+		if (enumFields != null) {
+			valuesMth.add(AFlag.DONT_GENERATE);
+		}
+		return enumFields;
+	}
+	private BlockInsnPair getValuesInitInsn(EnumData data) {
+		FieldInfo searchField = data.valuesField.getFieldInfo();
+		for (BlockNode blockNode : data.staticBlocks) {
+			for (InsnNode insn : blockNode.getInstructions()) {
+				if (insn.getType() == InsnType.SPUT) {
+					IndexInsnNode indexInsnNode = (IndexInsnNode) insn;
+					FieldInfo f = (FieldInfo) indexInsnNode.getIndex();
+					if (f.equals(searchField)) {
+						return new BlockInsnPair(blockNode, indexInsnNode);
+					}
+				}
+			}
+		}
+		return null;
+	}
+	private List<EnumField> extractEnumFieldsFromFilledArray(EnumData enumData, InsnNode arrFillInsn) {
+		List<EnumField> enumFields = new ArrayList<>();
+		for (InsnArg arg : arrFillInsn.getArguments()) {
+			EnumField field = null;
+			if (arg.isInsnWrap()) {
+				InsnNode wrappedInsn = ((InsnWrapArg) arg).getWrapInsn();
+				field = processEnumFieldByWrappedInsn(enumData, wrappedInsn);
+			} else if (arg.isRegister()) {
+				field = processEnumFieldByRegister(enumData, (RegisterArg) arg);
+			}
+			if (field == null) {
+				return null;
+			}
+			enumFields.add(field);
+		}
+		enumData.toRemove.add(arrFillInsn);
+		return enumFields;
+	}
+	private EnumField processEnumFieldByWrappedInsn(EnumData data, InsnNode wrappedInsn) {
+		if (wrappedInsn.getType() == InsnType.SGET) {
+			return processEnumFieldByField(data, wrappedInsn);
+		}
+		ConstructorInsn constructorInsn = castConstructorInsn(wrappedInsn);
+		if (constructorInsn != null) {
+			FieldNode enumFieldNode = createFakeField(data.cls, "EF" + constructorInsn.getOffset());
+			data.cls.addField(enumFieldNode);
+			return createEnumFieldByConstructor(data, enumFieldNode, constructorInsn);
+		}
+		return null;
+	}
+	@Nullable
+	private EnumField processEnumFieldByField(EnumData data, InsnNode sgetInsn) {
+		if (sgetInsn.getType() != InsnType.SGET) {
+			return null;
+		}
+		FieldInfo fieldInfo = (FieldInfo) ((IndexInsnNode) sgetInsn).getIndex();
+		FieldNode enumFieldNode = data.cls.searchField(fieldInfo);
+		if (enumFieldNode == null) {
+			return null;
+		}
+		InsnNode sputInsn = searchFieldPutInsn(data, enumFieldNode);
+		if (sputInsn == null) {
+			return null;
+		}
+		ConstructorInsn co = getConstructorInsn(sputInsn);
+		if (co == null) {
+			return null;
+		}
+		RegisterArg sgetResult = sgetInsn.getResult();
+		if (sgetResult == null || sgetResult.getSVar().getUseCount() == 1) {
+			data.toRemove.add(sgetInsn);
+		}
+		data.toRemove.add(sputInsn);
+		return createEnumFieldByConstructor(data, enumFieldNode, co);
+	}
+	@Nullable
+	private EnumField processEnumFieldByRegister(EnumData data, RegisterArg arg) {
+		InsnNode assignInsn = arg.getAssignInsn();
+		if (assignInsn != null && assignInsn.getType() == InsnType.SGET) {
+			return processEnumFieldByField(data, assignInsn);
+		}
+		SSAVar ssaVar = arg.getSVar();
+		if (ssaVar.getUseCount() == 0) {
+			return null;
+		}
+		InsnNode constrInsn = ssaVar.getAssign().getParentInsn();
+		if (constrInsn == null || constrInsn.getType() != InsnType.CONSTRUCTOR) {
+			return null;
+		}
+		FieldNode enumFieldNode = searchEnumField(data, ssaVar);
+		if (enumFieldNode == null) {
+			enumFieldNode = createFakeField(data.cls, "EF" + arg.getRegNum());
+			data.cls.addField(enumFieldNode);
+		}
+		return createEnumFieldByConstructor(data, enumFieldNode, (ConstructorInsn) constrInsn);
+	}
+	private FieldNode createFakeField(ClassNode cls, String name) {
+		FieldNode enumFieldNode;
+		FieldInfo fldInfo = FieldInfo.from(cls.root(), cls.getClassInfo(), name, cls.getType());
+		enumFieldNode = new FieldNode(cls, fldInfo, 0);
+		enumFieldNode.add(AFlag.SYNTHETIC);
+		enumFieldNode.addInfoComment("Fake field, exist only in values array");
+		return enumFieldNode;
+	}
+	@Nullable
+	private FieldNode searchEnumField(EnumData data, SSAVar ssaVar) {
+		InsnNode sputInsn = ssaVar.getUseList().get(0).getParentInsn();
+		if (sputInsn == null || sputInsn.getType() != InsnType.SPUT) {
+			return null;
+		}
+		FieldInfo fieldInfo = (FieldInfo) ((IndexInsnNode) sputInsn).getIndex();
+		FieldNode enumFieldNode = data.cls.searchField(fieldInfo);
+		if (enumFieldNode == null) {
+			return null;
+		}
+		data.toRemove.add(sputInsn);
+		return enumFieldNode;
+	}
+	@SuppressWarnings("StatementWithEmptyBody")
+	private EnumField createEnumFieldByConstructor(EnumData data, FieldNode enumFieldNode, ConstructorInsn co) {
+		if (co.getArgsCount() < 1) {
+			return null;
+		}
+		ClassNode cls = data.cls;
+		ClassInfo clsInfo = co.getClassType();
+		ClassNode constrCls = cls.root().resolveClass(clsInfo);
+		if (constrCls == null) {
+			return null;
+		}
+		if (constrCls.equals(cls)) {
+		} else if (constrCls.contains(AType.ANONYMOUS_CLASS)) {
+		} else {
+			return null;
+		}
+		MethodNode ctrMth = cls.root().resolveMethod(co.getCallMth());
+		if (ctrMth == null) {
+			return null;
+		}
+		List<RegisterArg> regs = new ArrayList<>();
+		co.getRegisterArgs(regs);
+		if (!regs.isEmpty()) {
+			ConstructorInsn replacedCo = inlineExternalRegs(data, co);
+			if (replacedCo == null) {
+				throw new JadxRuntimeException("Init of enum field '" + enumFieldNode.getName() + "' uses external variables");
+			}
+			data.toRemove.add(co);
+			co = replacedCo;
+		}
+		return new EnumField(enumFieldNode, co);
+	}
+	private ConstructorInsn inlineExternalRegs(EnumData data, ConstructorInsn co) {
+		ConstructorInsn resCo = co.copyWithoutResult();
+		List<RegisterArg> regs = new ArrayList<>();
+		resCo.getRegisterArgs(regs);
+		for (RegisterArg reg : regs) {
+			FieldInfo enumField = checkExternalRegUsage(data, reg);
+			if (enumField == null) {
+				return null;
+			}
+			InsnNode enumUse = new IndexInsnNode(InsnType.SGET, enumField, 0);
+			boolean replaced = resCo.replaceArg(reg, InsnArg.wrapArg(enumUse));
+			if (!replaced) {
+				return null;
+			}
+		}
+		return resCo;
+	}
+	private static FieldInfo checkExternalRegUsage(EnumData data, RegisterArg reg) {
+		ClassNode cls = data.cls;
+		SSAVar ssaVar = reg.getSVar();
+		InsnNode assignInsn = checkInsnType(ssaVar.getAssignInsn(), InsnType.CONSTRUCTOR);
+		if (assignInsn == null || !((ConstructorInsn) assignInsn).getClassType().equals(cls.getClassInfo())) {
+			return null;
+		}
+		FieldInfo enumField = null;
+		for (RegisterArg useArg : ssaVar.getUseList()) {
+			InsnNode useInsn = useArg.getParentInsn();
+			if (useInsn == null) {
+				return null;
+			}
+			switch (useInsn.getType()) {
+				case SPUT: {
+					FieldInfo field = (FieldInfo) ((IndexInsnNode) useInsn).getIndex();
+					if (!field.getDeclClass().equals(cls.getClassInfo())
+							|| !field.getType().equals(cls.getType())) {
+						return null;
+					}
+					enumField = field;
+					break;
+				}
+				case CONSTRUCTOR: {
+					ConstructorInsn useCo = (ConstructorInsn) useInsn;
+					if (!useCo.getClassType().equals(cls.getClassInfo())) {
+						return null;
+					}
+					break;
+				}
+				case FILLED_NEW_ARRAY: {
+					if (!data.valuesInitInsn.getArg(0).unwrap().equals(useInsn)) {
+						return null;
+					}
+					break;
+				}
+				default:
+					return null;
+			}
+		}
+		if (enumField != null) {
+			data.toRemove.add(assignInsn);
+		}
+		return enumField;
+	}
+	@Nullable
+	private InsnNode searchFieldPutInsn(EnumData data, FieldNode enumFieldNode) {
+		for (BlockNode block : data.staticBlocks) {
+			for (InsnNode sputInsn : block.getInstructions()) {
+				if (sputInsn != null && sputInsn.getType() == InsnType.SPUT) {
+					FieldInfo f = (FieldInfo) ((IndexInsnNode) sputInsn).getIndex();
+					FieldNode fieldNode = data.cls.searchField(f);
+					if (Objects.equals(fieldNode, enumFieldNode)) {
+						return sputInsn;
+					}
+				}
+			}
+		}
+		return null;
+	}
+	private void removeEnumMethods(ClassNode cls, FieldNode valuesField) {
+		ArgType clsType = cls.getClassInfo().getType();
+		String valuesMethodShortId = "values()" + TypeGen.signature(ArgType.array(clsType));
+		MethodNode valuesMethod = null;
+		for (MethodNode mth : cls.getMethods()) {
+			MethodInfo mi = mth.getMethodInfo();
+			if (mi.isClassInit() || mth.isNoCode()) {
+				continue;
+			}
+			String shortId = mi.getShortId();
+			if (mi.isConstructor()) {
+				if (isDefaultConstructor(mth, shortId)) {
+					mth.add(AFlag.DONT_GENERATE);
+				}
+				markArgsForSkip(mth);
+			} else if (mi.getShortId().equals(valuesMethodShortId)) {
+				if (isValuesMethod(mth, clsType)) {
+					valuesMethod = mth;
+					mth.add(AFlag.DONT_GENERATE);
+				} else {
+					mth.getMethodInfo().setAlias("valuesCustom");
+					mth.addAttr(new RenameReasonAttr(mth).append("to resolve conflict with enum method"));
+				}
+			} else if (isValuesMethod(mth, clsType)) {
+				if (!mth.getMethodInfo().getAlias().equals("values") && !mth.getUseIn().isEmpty()) {
+					mth.getMethodInfo().setAlias("values");
+					mth.addAttr(new RenameReasonAttr(mth).append("to match enum method name"));
+					mth.add(AFlag.DONT_RENAME);
+				}
+				valuesMethod = mth;
+				mth.add(AFlag.DONT_GENERATE);
+			} else if (simpleValueOfMth(mth, clsType)) {
+				mth.add(AFlag.DONT_GENERATE);
+			}
+		}
+		FieldInfo valuesFieldInfo = valuesField.getFieldInfo();
+		for (MethodNode mth : cls.getMethods()) {
+			fixValuesAccess(mth, valuesFieldInfo, clsType, valuesMethod);
+		}
+	}
+	private void markArgsForSkip(MethodNode mth) {
+		SkipMethodArgsAttr.skipArg(mth, 0);
+		if (mth.getMethodInfo().getArgsCount() > 1) {
+			SkipMethodArgsAttr.skipArg(mth, 1);
+		}
+	}
+	private boolean isDefaultConstructor(MethodNode mth, String shortId) {
+		boolean defaultId = shortId.equals("<init>(Ljava/lang/String;I)V")
+				|| shortId.equals("<init>(Ljava/lang/String;)V");
+		if (defaultId) {
+			return mth.countInsns() == 0;
+		}
+		return false;
+	}
+	private boolean isValuesMethod(MethodNode mth, ArgType clsType) {
+		ArgType retType = mth.getReturnType();
+		if (!retType.isArray() || !retType.getArrayElement().equals(clsType)) {
+			return false;
+		}
+		InsnNode returnInsn = BlockUtils.getOnlyOneInsnFromMth(mth);
+		if (returnInsn == null || returnInsn.getType() != InsnType.RETURN || returnInsn.getArgsCount() != 1) {
+			return false;
+		}
+		InsnNode wrappedInsn = getWrappedInsn(getSingleArg(returnInsn));
+		IndexInsnNode castInsn = (IndexInsnNode) checkInsnType(wrappedInsn, InsnType.CHECK_CAST);
+		if (castInsn != null && Objects.equals(castInsn.getIndex(), ArgType.array(clsType))) {
+			InvokeNode invokeInsn = (InvokeNode) checkInsnType(getWrappedInsn(getSingleArg(castInsn)), InsnType.INVOKE);
+			return invokeInsn != null && invokeInsn.getCallMth().equals(cloneMth);
+		}
+		return false;
+	}
+	private boolean simpleValueOfMth(MethodNode mth, ArgType clsType) {
+		InsnNode returnInsn = InsnUtils.searchSingleReturnInsn(mth, insn -> insn.getArgsCount() == 1);
+		if (returnInsn == null) {
+			return false;
+		}
+		InsnNode wrappedInsn = getWrappedInsn(getSingleArg(returnInsn));
+		IndexInsnNode castInsn = (IndexInsnNode) checkInsnType(wrappedInsn, InsnType.CHECK_CAST);
+		if (castInsn != null && Objects.equals(castInsn.getIndex(), clsType)) {
+			InvokeNode invokeInsn = (InvokeNode) checkInsnType(getWrappedInsn(getSingleArg(castInsn)), InsnType.INVOKE);
+			return invokeInsn != null && invokeInsn.getCallMth().equals(enumValueOfMth);
+		}
+		return false;
+	}
+	private void fixValuesAccess(MethodNode mth, FieldInfo valuesFieldInfo, ArgType clsType, @Nullable MethodNode valuesMethod) {
+		MethodInfo mi = mth.getMethodInfo();
+		if (mi.isConstructor() || mi.isClassInit() || mth.isNoCode() || mth == valuesMethod) {
+			return;
+		}
+		Predicate<InsnNode> insnTest = insn -> Objects.equals(((IndexInsnNode) insn).getIndex(), valuesFieldInfo);
+		InsnNode useInsn = InsnUtils.searchInsn(mth, InsnType.SGET, insnTest);
+		if (useInsn == null) {
+			return;
+		}
+		InsnUtils.replaceInsns(mth, insn -> {
+			if (insn.getType() == InsnType.SGET && insnTest.test(insn)) {
+				MethodInfo valueMth = valuesMethod == null
+						? getValueMthInfo(mth.root(), clsType)
+						: valuesMethod.getMethodInfo();
+				InvokeNode invokeNode = new InvokeNode(valueMth, InvokeType.STATIC, 0);
+				invokeNode.setResult(insn.getResult());
+				if (valuesMethod == null) {
+					invokeNode.add(AFlag.FORCE_RAW_NAME);
+				}
+				mth.addDebugComment("Replace access to removed values field (" + valuesFieldInfo.getName() + ") with 'values()' method");
+				return invokeNode;
+			}
+			return null;
+		});
+	}
+	private MethodInfo getValueMthInfo(RootNode root, ArgType clsType) {
+		return MethodInfo.fromDetails(root,
+				ClassInfo.fromType(root, clsType),
+				"values",
+				Collections.emptyList(), ArgType.array(clsType));
+	}
+	private static void processEnumCls(ClassNode cls, EnumField field, ClassNode innerCls) {
+		for (MethodNode innerMth : innerCls.getMethods()) {
+			if (innerMth.getAccessFlags().isConstructor()) {
+				innerMth.add(AFlag.DONT_GENERATE);
+			}
+		}
+		field.setCls(innerCls);
+		if (!innerCls.getParentClass().equals(cls)) {
+			cls.addInlinedClass(innerCls);
+			innerCls.add(AFlag.DONT_GENERATE);
+		}
+	}
+	private ConstructorInsn getConstructorInsn(InsnNode insn) {
+		if (insn.getArgsCount() != 1) {
+			return null;
+		}
+		InsnArg arg = insn.getArg(0);
+		if (arg.isInsnWrap()) {
+			return castConstructorInsn(((InsnWrapArg) arg).getWrapInsn());
+		}
+		if (arg.isRegister()) {
+			return castConstructorInsn(((RegisterArg) arg).getAssignInsn());
+		}
+		return null;
+	}
+	@Nullable
+	private ConstructorInsn castConstructorInsn(InsnNode coCandidate) {
+		if (coCandidate != null && coCandidate.getType() == InsnType.CONSTRUCTOR) {
+			return (ConstructorInsn) coCandidate;
+		}
+		return null;
+	}
+	private String getConstString(RootNode root, InsnArg arg) {
+		if (arg.isInsnWrap()) {
+			InsnNode constInsn = ((InsnWrapArg) arg).getWrapInsn();
+			Object constValue = InsnUtils.getConstValueByInsn(root, constInsn);
+			if (constValue instanceof String) {
+				return (String) constValue;
+			}
+		}
+		return null;
+	}
+	private static class EnumData {
+		final ClassNode cls;
+		final MethodNode classInitMth;
+		final List<BlockNode> staticBlocks;
+		final List<InsnNode> toRemove = new ArrayList<>();
+		FieldNode valuesField;
+		InsnNode valuesInitInsn;
+		public EnumData(ClassNode cls, MethodNode classInitMth, List<BlockNode> staticBlocks) {
+			this.cls = cls;
+			this.classInitMth = classInitMth;
+			this.staticBlocks = staticBlocks;
+		}
+	}
+}
+_____
+package jadx.core;
+import java.io.InputStream;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Enumeration;
+import java.util.List;
+import java.util.jar.Manifest;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import jadx.api.CommentsLevel;
+import jadx.api.JadxArgs;
+import jadx.core.deobf.DeobfuscatorVisitor;
+import jadx.core.deobf.SaveDeobfMapping;
+import jadx.core.dex.attributes.AFlag;
+import jadx.core.dex.visitors.AnonymousClassVisitor;
+import jadx.core.dex.visitors.AttachCommentsVisitor;
+import jadx.core.dex.visitors.AttachMethodDetails;
+import jadx.core.dex.visitors.AttachTryCatchVisitor;
+import jadx.core.dex.visitors.CheckCode;
+import jadx.core.dex.visitors.ClassModifier;
+import jadx.core.dex.visitors.ConstInlineVisitor;
+import jadx.core.dex.visitors.ConstructorVisitor;
+import jadx.core.dex.visitors.DeboxingVisitor;
+import jadx.core.dex.visitors.DotGraphVisitor;
+import jadx.core.dex.visitors.EnumVisitor;
+import jadx.core.dex.visitors.ExtractFieldInit;
+import jadx.core.dex.visitors.FallbackModeVisitor;
+import jadx.core.dex.visitors.FixSwitchOverEnum;
+import jadx.core.dex.visitors.GenericTypesVisitor;
+import jadx.core.dex.visitors.IDexTreeVisitor;
+import jadx.core.dex.visitors.InitCodeVariables;
+import jadx.core.dex.visitors.InlineMethods;
+import jadx.core.dex.visitors.MarkMethodsForInline;
+import jadx.core.dex.visitors.MethodInvokeVisitor;
+import jadx.core.dex.visitors.MethodVisitor;
+import jadx.core.dex.visitors.ModVisitor;
+import jadx.core.dex.visitors.MoveInlineVisitor;
+import jadx.core.dex.visitors.OverrideMethodVisitor;
+import jadx.core.dex.visitors.PrepareForCodeGen;
+import jadx.core.dex.visitors.ProcessAnonymous;
+import jadx.core.dex.visitors.ProcessInstructionsVisitor;
+import jadx.core.dex.visitors.ProcessMethodsForInline;
+import jadx.core.dex.visitors.ReplaceNewArray;
+import jadx.core.dex.visitors.ShadowFieldVisitor;
+import jadx.core.dex.visitors.SignatureProcessor;
+import jadx.core.dex.visitors.SimplifyVisitor;
+import jadx.core.dex.visitors.blocks.BlockFinisher;
+import jadx.core.dex.visitors.blocks.BlockProcessor;
+import jadx.core.dex.visitors.blocks.BlockSplitter;
+import jadx.core.dex.visitors.debuginfo.DebugInfoApplyVisitor;
+import jadx.core.dex.visitors.debuginfo.DebugInfoAttachVisitor;
+import jadx.core.dex.visitors.finaly.MarkFinallyVisitor;
+import jadx.core.dex.visitors.fixaccessmodifiers.FixAccessModifiers;
+import jadx.core.dex.visitors.gradle.NonFinalResIdsVisitor;
+import jadx.core.dex.visitors.kotlin.ProcessKotlinInternals;
+import jadx.core.dex.visitors.prepare.AddAndroidConstants;
+import jadx.core.dex.visitors.prepare.CollectConstValues;
+import jadx.core.dex.visitors.regions.CheckRegions;
+import jadx.core.dex.visitors.regions.CleanRegions;
+import jadx.core.dex.visitors.regions.IfRegionVisitor;
+import jadx.core.dex.visitors.regions.LoopRegionVisitor;
+import jadx.core.dex.visitors.regions.RegionMakerVisitor;
+import jadx.core.dex.visitors.regions.ReturnVisitor;
+import jadx.core.dex.visitors.regions.SwitchOverStringVisitor;
+import jadx.core.dex.visitors.regions.variables.ProcessVariables;
+import jadx.core.dex.visitors.rename.CodeRenameVisitor;
+import jadx.core.dex.visitors.rename.RenameVisitor;
+import jadx.core.dex.visitors.rename.SourceFileRename;
+import jadx.core.dex.visitors.shrink.CodeShrinkVisitor;
+import jadx.core.dex.visitors.ssa.SSATransform;
+import jadx.core.dex.visitors.typeinference.FinishTypeInference;
+import jadx.core.dex.visitors.typeinference.FixTypesVisitor;
+import jadx.core.dex.visitors.typeinference.TypeInferenceVisitor;
+import jadx.core.dex.visitors.usage.UsageInfoVisitor;
+import jadx.core.utils.exceptions.JadxRuntimeException;
+public class Jadx {
+	private static final Logger LOG = LoggerFactory.getLogger(Jadx.class);
+	private Jadx() {
+	}
+	public static List<IDexTreeVisitor> getPassesList(JadxArgs args) {
+		switch (args.getDecompilationMode()) {
+			case AUTO:
+			case RESTRUCTURE:
+				return getRegionsModePasses(args);
+			case SIMPLE:
+				return getSimpleModePasses(args);
+			case FALLBACK:
+				return getFallbackPassesList();
+			default:
+				throw new JadxRuntimeException("Unknown decompilation mode: " + args.getDecompilationMode());
+		}
+	}
+	public static List<IDexTreeVisitor> getPreDecompilePassesList() {
+		List<IDexTreeVisitor> passes = new ArrayList<>();
+		passes.add(new SignatureProcessor());
+		passes.add(new OverrideMethodVisitor());
+		passes.add(new AddAndroidConstants());
+		passes.add(new CollectConstValues());
+		passes.add(new DeobfuscatorVisitor());
+		passes.add(new SourceFileRename());
+		passes.add(new RenameVisitor());
+		passes.add(new SaveDeobfMapping());
+		passes.add(new UsageInfoVisitor());
+		passes.add(new ProcessAnonymous());
+		passes.add(new ProcessMethodsForInline());
+		return passes;
+	}
+	public static List<IDexTreeVisitor> getRegionsModePasses(JadxArgs args) {
+		List<IDexTreeVisitor> passes = new ArrayList<>();
+		passes.add(new CheckCode());
+		if (args.isDebugInfo()) {
+			passes.add(new DebugInfoAttachVisitor());
+		}
+		passes.add(new AttachTryCatchVisitor());
+		if (args.getCommentsLevel() != CommentsLevel.NONE) {
+			passes.add(new AttachCommentsVisitor());
+		}
+		passes.add(new AttachMethodDetails());
+		passes.add(new ProcessInstructionsVisitor());
+		passes.add(new BlockSplitter());
+		passes.add(new BlockProcessor());
+		passes.add(new BlockFinisher());
+		if (args.isRawCFGOutput()) {
+			passes.add(DotGraphVisitor.dumpRaw());
+		}
+		passes.add(new SSATransform());
+		passes.add(new MoveInlineVisitor());
+		passes.add(new ConstructorVisitor());
+		passes.add(new InitCodeVariables());
+		if (args.isExtractFinally()) {
+			passes.add(new MarkFinallyVisitor());
+		}
+		passes.add(new ConstInlineVisitor());
+		passes.add(new TypeInferenceVisitor());
+		if (args.isDebugInfo()) {
+			passes.add(new DebugInfoApplyVisitor());
+		}
+		passes.add(new FixTypesVisitor());
+		passes.add(new FinishTypeInference());
+		if (args.getUseKotlinMethodsForVarNames() != JadxArgs.UseKotlinMethodsForVarNames.DISABLE) {
+			passes.add(new ProcessKotlinInternals());
+		}
+		passes.add(new CodeRenameVisitor());
+		if (args.isInlineMethods()) {
+			passes.add(new InlineMethods());
+		}
+		passes.add(new GenericTypesVisitor());
+		passes.add(new ShadowFieldVisitor());
+		passes.add(new DeboxingVisitor());
+		passes.add(new AnonymousClassVisitor());
+		passes.add(new ModVisitor());
+		passes.add(new CodeShrinkVisitor());
+		passes.add(new ReplaceNewArray());
+		if (args.isCfgOutput()) {
+			passes.add(DotGraphVisitor.dump());
+		}
+		passes.add(new RegionMakerVisitor());
+		passes.add(new IfRegionVisitor());
+		if (args.isRestoreSwitchOverString()) {
+			passes.add(new SwitchOverStringVisitor());
+		}
+		passes.add(new ReturnVisitor());
+		passes.add(new CleanRegions());
+		passes.add(new CodeShrinkVisitor());
+		passes.add(new MethodInvokeVisitor());
+		passes.add(new SimplifyVisitor());
+		passes.add(new CheckRegions());
+		passes.add(new EnumVisitor());
+		passes.add(new FixSwitchOverEnum());
+		passes.add(new NonFinalResIdsVisitor());
+		passes.add(new ExtractFieldInit());
+		passes.add(new FixAccessModifiers());
+		passes.add(new ClassModifier());
+		passes.add(new LoopRegionVisitor());
+		if (args.isInlineMethods()) {
+			passes.add(new MarkMethodsForInline());
+		}
+		passes.add(new ProcessVariables());
+		passes.add(new PrepareForCodeGen());
+		if (args.isCfgOutput()) {
+			passes.add(DotGraphVisitor.dumpRegions());
+		}
+		return passes;
+	}
+	public static List<IDexTreeVisitor> getSimpleModePasses(JadxArgs args) {
+		List<IDexTreeVisitor> passes = new ArrayList<>();
+		if (args.isDebugInfo()) {
+			passes.add(new DebugInfoAttachVisitor());
+		}
+		passes.add(new AttachTryCatchVisitor());
+		if (args.getCommentsLevel() != CommentsLevel.NONE) {
+			passes.add(new AttachCommentsVisitor());
+		}
+		passes.add(new AttachMethodDetails());
+		passes.add(new ProcessInstructionsVisitor());
+		passes.add(new BlockSplitter());
+		if (args.isRawCFGOutput()) {
+			passes.add(DotGraphVisitor.dumpRaw());
+		}
+		passes.add(new MethodVisitor("DisableBlockLock", mth -> mth.add(AFlag.DISABLE_BLOCKS_LOCK)));
+		passes.add(new BlockProcessor());
+		passes.add(new SSATransform());
+		passes.add(new MoveInlineVisitor());
+		passes.add(new ConstructorVisitor());
+		passes.add(new InitCodeVariables());
+		passes.add(new ConstInlineVisitor());
+		passes.add(new TypeInferenceVisitor());
+		if (args.isDebugInfo()) {
+			passes.add(new DebugInfoApplyVisitor());
+		}
+		passes.add(new FixTypesVisitor());
+		passes.add(new FinishTypeInference());
+		passes.add(new CodeRenameVisitor());
+		passes.add(new DeboxingVisitor());
+		passes.add(new ModVisitor());
+		passes.add(new CodeShrinkVisitor());
+		passes.add(new ReplaceNewArray());
+		passes.add(new SimplifyVisitor());
+		passes.add(new MethodVisitor("ForceGenerateAll", mth -> mth.remove(AFlag.DONT_GENERATE)));
+		if (args.isCfgOutput()) {
+			passes.add(DotGraphVisitor.dump());
+		}
+		return passes;
+	}
+	public static List<IDexTreeVisitor> getFallbackPassesList() {
+		List<IDexTreeVisitor> passes = new ArrayList<>();
+		passes.add(new AttachTryCatchVisitor());
+		passes.add(new AttachCommentsVisitor());
+		passes.add(new ProcessInstructionsVisitor());
+		passes.add(new FallbackModeVisitor());
+		return passes;
+	}
+	public static final String VERSION_DEV = "dev";
+	private static String version;
+	public static String getVersion() {
+		if (version == null) {
+			version = searchJadxVersion();
+		}
+		return version;
+	}
+	public static boolean isDevVersion() {
+		return getVersion().equals(VERSION_DEV);
+	}
+	private static String searchJadxVersion() {
+		try {
+			ClassLoader classLoader = Jadx.class.getClassLoader();
+			if (classLoader != null) {
+				Enumeration<URL> resources = classLoader.getResources("META-INF/MANIFEST.MF");
+				while (resources.hasMoreElements()) {
+					try (InputStream is = resources.nextElement().openStream()) {
+						Manifest manifest = new Manifest(is);
+						String ver = manifest.getMainAttributes().getValue("jadx-version");
+						if (ver != null) {
+							return ver;
+						}
+					}
+				}
+			}
+		} catch (Exception e) {
+			LOG.error("Can't get manifest file", e);
+		}
+		return VERSION_DEV;
+	}
+}
+_____
+package jadx.core;
+public class Consts {
+	public static final boolean DEBUG = false;
+	public static final boolean DEBUG_WITH_ERRORS = false; 
+	public static final boolean DEBUG_USAGE = false;
+	public static final boolean DEBUG_TYPE_INFERENCE = false;
+	public static final boolean DEBUG_OVERLOADED_CASTS = false;
+	public static final boolean DEBUG_EXC_HANDLERS = false;
+	public static final boolean DEBUG_FINALLY = false;
+	public static final boolean DEBUG_ATTRIBUTES = false;
+	public static final boolean DEBUG_RESTRUCTURE = false;
+	public static final boolean DEBUG_EVENTS = Jadx.isDevVersion();
+	public static final String CLASS_OBJECT = "java.lang.Object";
+	public static final String CLASS_STRING = "java.lang.String";
+	public static final String CLASS_CLASS = "java.lang.Class";
+	public static final String CLASS_THROWABLE = "java.lang.Throwable";
+	public static final String CLASS_EXCEPTION = "java.lang.Exception";
+	public static final String CLASS_ENUM = "java.lang.Enum";
+	public static final String CLASS_STRING_BUILDER = "java.lang.StringBuilder";
+	public static final String OVERRIDE_ANNOTATION = "Ljava/lang/Override;";
+	public static final String DEFAULT_PACKAGE_NAME = "defpackage";
+	public static final String ANONYMOUS_CLASS_PREFIX = "AnonymousClass";
+	public static final String MTH_TOSTRING_SIGNATURE = "toString()Ljava/lang/String;";
+	private Consts() {
+	}
+}

@@ -1,0 +1,617 @@
+SEVERIY = 5
+
+package jadx.plugins.input.dex.sections;
+import java.util.ArrayList;
+import java.util.List;
+import org.jetbrains.annotations.Nullable;
+import jadx.api.plugins.input.data.IFieldData;
+import jadx.api.plugins.input.data.annotations.EncodedValue;
+import jadx.api.plugins.input.data.annotations.IAnnotation;
+import jadx.api.plugins.input.data.attributes.IJadxAttribute;
+import jadx.api.plugins.utils.Utils;
+import jadx.plugins.input.dex.sections.annotations.AnnotationsParser;
+public class DexFieldData implements IFieldData {
+	@Nullable
+	private final AnnotationsParser annotationsParser;
+	private String parentClassType;
+	private String type;
+	private String name;
+	private int accessFlags;
+	private int annotationsOffset;
+	private EncodedValue constValue;
+	public DexFieldData(@Nullable AnnotationsParser parser) {
+		this.annotationsParser = parser;
+	}
+	@Override
+	public String getParentClassType() {
+		return parentClassType;
+	}
+	public void setParentClassType(String parentClassType) {
+		this.parentClassType = parentClassType;
+	}
+	@Override
+	public String getType() {
+		return type;
+	}
+	public void setType(String type) {
+		this.type = type;
+	}
+	@Override
+	public String getName() {
+		return name;
+	}
+	public void setName(String name) {
+		this.name = name;
+	}
+	@Override
+	public int getAccessFlags() {
+		return accessFlags;
+	}
+	public void setAccessFlags(int accessFlags) {
+		this.accessFlags = accessFlags;
+	}
+	public void setAnnotationsOffset(int annotationsOffset) {
+		this.annotationsOffset = annotationsOffset;
+	}
+	public void setConstValue(EncodedValue constValue) {
+		this.constValue = constValue;
+	}
+	private List<IAnnotation> getAnnotations() {
+		if (annotationsParser == null) {
+			throw new NullPointerException("Annotation parser not initialized");
+		}
+		return annotationsParser.readAnnotationList(annotationsOffset);
+	}
+	@Override
+	public List<IJadxAttribute> getAttributes() {
+		List<IJadxAttribute> list = new ArrayList<>(2);
+		Utils.addToList(list, constValue);
+		DexAnnotationsConvert.forField(list, getAnnotations());
+		return list;
+	}
+	@Override
+	public String toString() {
+		return getParentClassType() + "->" + getName() + ":" + getType();
+	}
+}
+_______
+package jadx.plugins.input.dex.sections.annotations;
+import java.util.ArrayList;
+import java.util.List;
+import jadx.api.plugins.input.data.annotations.EncodedType;
+import jadx.api.plugins.input.data.annotations.EncodedValue;
+import jadx.plugins.input.dex.DexException;
+import jadx.plugins.input.dex.sections.SectionReader;
+public class EncodedValueParser {
+	private static final int ENCODED_BYTE = 0x00;
+	private static final int ENCODED_SHORT = 0x02;
+	private static final int ENCODED_CHAR = 0x03;
+	private static final int ENCODED_INT = 0x04;
+	private static final int ENCODED_LONG = 0x06;
+	private static final int ENCODED_FLOAT = 0x10;
+	private static final int ENCODED_DOUBLE = 0x11;
+	private static final int ENCODED_METHOD_TYPE = 0x15;
+	private static final int ENCODED_METHOD_HANDLE = 0x16;
+	private static final int ENCODED_STRING = 0x17;
+	private static final int ENCODED_TYPE = 0x18;
+	private static final int ENCODED_FIELD = 0x19;
+	private static final int ENCODED_ENUM = 0x1b;
+	private static final int ENCODED_METHOD = 0x1a;
+	private static final int ENCODED_ARRAY = 0x1c;
+	private static final int ENCODED_ANNOTATION = 0x1d;
+	private static final int ENCODED_NULL = 0x1e;
+	private static final int ENCODED_BOOLEAN = 0x1f;
+	static EncodedValue parseValue(SectionReader in, SectionReader ext) {
+		int argAndType = in.readUByte();
+		int type = argAndType & 0x1F;
+		int arg = (argAndType & 0xE0) >> 5;
+		int size = arg + 1;
+		switch (type) {
+			case ENCODED_NULL:
+				return EncodedValue.NULL;
+			case ENCODED_BOOLEAN:
+				return new EncodedValue(EncodedType.ENCODED_BOOLEAN, arg == 1);
+			case ENCODED_BYTE:
+				return new EncodedValue(EncodedType.ENCODED_BYTE, in.readByte());
+			case ENCODED_SHORT:
+				return new EncodedValue(EncodedType.ENCODED_SHORT, (short) parseNumber(in, size, true));
+			case ENCODED_CHAR:
+				return new EncodedValue(EncodedType.ENCODED_CHAR, (char) parseUnsignedInt(in, size));
+			case ENCODED_INT:
+				return new EncodedValue(EncodedType.ENCODED_INT, (int) parseNumber(in, size, true));
+			case ENCODED_LONG:
+				return new EncodedValue(EncodedType.ENCODED_LONG, parseNumber(in, size, true));
+			case ENCODED_FLOAT:
+				return new EncodedValue(EncodedType.ENCODED_FLOAT, Float.intBitsToFloat((int) parseNumber(in, size, false, 4)));
+			case ENCODED_DOUBLE:
+				return new EncodedValue(EncodedType.ENCODED_DOUBLE, Double.longBitsToDouble(parseNumber(in, size, false, 8)));
+			case ENCODED_STRING:
+				return new EncodedValue(EncodedType.ENCODED_STRING, ext.getString(parseUnsignedInt(in, size)));
+			case ENCODED_TYPE:
+				return new EncodedValue(EncodedType.ENCODED_TYPE, ext.getType(parseUnsignedInt(in, size)));
+			case ENCODED_FIELD:
+			case ENCODED_ENUM:
+				return new EncodedValue(EncodedType.ENCODED_FIELD, ext.getFieldRef(parseUnsignedInt(in, size)));
+			case ENCODED_ARRAY:
+				return new EncodedValue(EncodedType.ENCODED_ARRAY, parseEncodedArray(in, ext));
+			case ENCODED_ANNOTATION:
+				return new EncodedValue(EncodedType.ENCODED_ANNOTATION, AnnotationsParser.readAnnotation(in, ext, false));
+			case ENCODED_METHOD:
+				return new EncodedValue(EncodedType.ENCODED_METHOD, ext.getMethodRef(parseUnsignedInt(in, size)));
+			case ENCODED_METHOD_TYPE:
+				return new EncodedValue(EncodedType.ENCODED_METHOD_TYPE, ext.getMethodProto(parseUnsignedInt(in, size)));
+			case ENCODED_METHOD_HANDLE:
+				return new EncodedValue(EncodedType.ENCODED_METHOD_HANDLE, ext.getMethodHandle(parseUnsignedInt(in, size)));
+			default:
+				throw new DexException("Unknown encoded value type: 0x" + Integer.toHexString(type));
+		}
+	}
+	public static List<EncodedValue> parseEncodedArray(SectionReader in, SectionReader ext) {
+		int count = in.readUleb128();
+		List<EncodedValue> values = new ArrayList<>(count);
+		for (int i = 0; i < count; i++) {
+			values.add(parseValue(in, ext));
+		}
+		return values;
+	}
+	private static int parseUnsignedInt(SectionReader in, int byteCount) {
+		return (int) parseNumber(in, byteCount, false, 0);
+	}
+	private static long parseNumber(SectionReader in, int byteCount, boolean isSignExtended) {
+		return parseNumber(in, byteCount, isSignExtended, 0);
+	}
+	private static long parseNumber(SectionReader in, int byteCount, boolean isSignExtended, int fillOnRight) {
+		long result = 0;
+		long last = 0;
+		for (int i = 0; i < byteCount; i++) {
+			last = in.readUByte();
+			result |= last << (i * 8);
+		}
+		if (fillOnRight != 0) {
+			for (int i = byteCount; i < fillOnRight; i++) {
+				result <<= 8;
+			}
+		} else {
+			if (isSignExtended && (last & 0x80) != 0) {
+				for (int i = byteCount; i < 8; i++) {
+					result |= (long) 0xFF << (i * 8);
+				}
+			}
+		}
+		return result;
+	}
+}
+_______
+package jadx.plugins.input.dex.sections;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import org.jetbrains.annotations.Nullable;
+import jadx.api.plugins.input.data.ICallSite;
+import jadx.api.plugins.input.data.IFieldRef;
+import jadx.api.plugins.input.data.IMethodHandle;
+import jadx.api.plugins.input.data.MethodHandleType;
+import jadx.api.plugins.input.data.impl.CallSite;
+import jadx.api.plugins.input.data.impl.FieldRefHandle;
+import jadx.api.plugins.input.data.impl.MethodRefHandle;
+import jadx.plugins.input.dex.DexReader;
+import jadx.plugins.input.dex.sections.annotations.EncodedValueParser;
+import jadx.plugins.input.dex.utils.Leb128;
+import jadx.plugins.input.dex.utils.MUtf8;
+import static jadx.plugins.input.dex.sections.DexConsts.NO_INDEX;
+public class SectionReader {
+	private final ByteBuffer buf;
+	private final DexReader dexReader;
+	private int offset;
+	public SectionReader(DexReader dexReader, int off) {
+		this.dexReader = dexReader;
+		this.offset = off;
+		this.buf = duplicate(dexReader.getBuf(), off);
+	}
+	private SectionReader(SectionReader sectionReader, int off) {
+		this(sectionReader.dexReader, off);
+	}
+	public SectionReader copy() {
+		return new SectionReader(this, offset);
+	}
+	public SectionReader copy(int off) {
+		return new SectionReader(this, off);
+	}
+	public byte[] getByteCode(int start, int len) {
+		int pos = buf.position();
+		buf.position(start);
+		byte[] bytes = readByteArray(len);
+		buf.position(pos);
+		return bytes;
+	}
+	private static ByteBuffer duplicate(ByteBuffer baseBuffer, int off) {
+		ByteBuffer dupBuf = baseBuffer.duplicate();
+		dupBuf.order(ByteOrder.LITTLE_ENDIAN);
+		dupBuf.position(off);
+		return dupBuf;
+	}
+	public void setOffset(int offset) {
+		this.offset = offset;
+	}
+	public int getOffset() {
+		return offset;
+	}
+	public void shiftOffset(int shift) {
+		this.offset += shift;
+	}
+	public SectionReader pos(int pos) {
+		buf.position(offset + pos);
+		return this;
+	}
+	public SectionReader absPos(int pos) {
+		buf.position(pos);
+		return this;
+	}
+	public int getAbsPos() {
+		return buf.position();
+	}
+	public void skip(int skip) {
+		int pos = buf.position();
+		buf.position(pos + skip);
+	}
+	public int readInt() {
+		return buf.getInt();
+	}
+	public long readLong() {
+		return buf.getLong();
+	}
+	public byte readByte() {
+		return buf.get();
+	}
+	public int readUByte() {
+		return buf.get() & 0xFF;
+	}
+	public int readUShort() {
+		return buf.getShort() & 0xFFFF;
+	}
+	public int readShort() {
+		return buf.getShort();
+	}
+	public byte[] readByteArray(int len) {
+		byte[] arr = new byte[len];
+		buf.get(arr);
+		return arr;
+	}
+	public int[] readUShortArray(int size) {
+		int[] arr = new int[size];
+		for (int i = 0; i < size; i++) {
+			arr[i] = readUShort();
+		}
+		return arr;
+	}
+	public String readString(int len) {
+		return new String(readByteArray(len), StandardCharsets.US_ASCII);
+	}
+	private List<String> readTypeListAt(int paramsOff) {
+		if (paramsOff == 0) {
+			return Collections.emptyList();
+		}
+		return absPos(paramsOff).readTypeList();
+	}
+	public List<String> readTypeList() {
+		int size = readInt();
+		if (size == 0) {
+			return Collections.emptyList();
+		}
+		int[] typeIds = readUShortArray(size);
+		List<String> types = new ArrayList<>(size);
+		for (int typeId : typeIds) {
+			types.add(getType(typeId));
+		}
+		return types;
+	}
+	@Nullable
+	public String getType(int idx) {
+		if (idx == NO_INDEX) {
+			return null;
+		}
+		int typeIdsOff = dexReader.getHeader().getTypeIdsOff();
+		absPos(typeIdsOff + idx * 4);
+		int strIdx = readInt();
+		return getString(strIdx);
+	}
+	@Nullable
+	public String getString(int idx) {
+		if (idx == NO_INDEX) {
+			return null;
+		}
+		int stringIdsOff = dexReader.getHeader().getStringIdsOff();
+		absPos(stringIdsOff + idx * 4);
+		int strOff = readInt();
+		absPos(strOff);
+		return MUtf8.decode(this);
+	}
+	public IFieldRef getFieldRef(int idx) {
+		DexFieldData fieldData = new DexFieldData(null);
+		int clsTypeIdx = fillFieldData(fieldData, idx);
+		fieldData.setParentClassType(getType(clsTypeIdx));
+		return fieldData;
+	}
+	public int fillFieldData(DexFieldData fieldData, int idx) {
+		int fieldIdsOff = dexReader.getHeader().getFieldIdsOff();
+		absPos(fieldIdsOff + idx * 8);
+		int classTypeIdx = readUShort();
+		int typeIdx = readUShort();
+		int nameIdx = readInt();
+		fieldData.setType(getType(typeIdx));
+		fieldData.setName(getString(nameIdx));
+		return classTypeIdx;
+	}
+	public DexMethodRef getMethodRef(int idx) {
+		DexMethodRef methodRef = new DexMethodRef();
+		initMethodRef(idx, methodRef);
+		return methodRef;
+	}
+	public ICallSite getCallSite(int idx, SectionReader ext) {
+		int callSiteOff = dexReader.getHeader().getCallSiteOff();
+		absPos(callSiteOff + idx * 4);
+		absPos(readInt());
+		return new CallSite(EncodedValueParser.parseEncodedArray(this, ext));
+	}
+	public IMethodHandle getMethodHandle(int idx) {
+		int methodHandleOff = dexReader.getHeader().getMethodHandleOff();
+		absPos(methodHandleOff + idx * 8);
+		MethodHandleType handleType = getMethodHandleType(readUShort());
+		skip(2);
+		int refId = readUShort();
+		if (handleType.isField()) {
+			return new FieldRefHandle(handleType, getFieldRef(refId));
+		}
+		return new MethodRefHandle(handleType, getMethodRef(refId));
+	}
+	private MethodHandleType getMethodHandleType(int type) {
+		switch (type) {
+			case 0x00:
+				return MethodHandleType.STATIC_PUT;
+			case 0x01:
+				return MethodHandleType.STATIC_GET;
+			case 0x02:
+				return MethodHandleType.INSTANCE_PUT;
+			case 0x03:
+				return MethodHandleType.INSTANCE_GET;
+			case 0x04:
+				return MethodHandleType.INVOKE_STATIC;
+			case 0x05:
+				return MethodHandleType.INVOKE_INSTANCE;
+			case 0x06:
+				return MethodHandleType.INVOKE_CONSTRUCTOR;
+			case 0x07:
+				return MethodHandleType.INVOKE_DIRECT;
+			case 0x08:
+				return MethodHandleType.INVOKE_INTERFACE;
+			default:
+				throw new IllegalArgumentException("Unknown method handle type: 0x" + Integer.toHexString(type));
+		}
+	}
+	public void initMethodRef(int idx, DexMethodRef methodRef) {
+		methodRef.initUniqId(dexReader, idx);
+		methodRef.setDexIdx(idx);
+		methodRef.setSectionReader(this);
+	}
+	public void loadMethodRef(DexMethodRef methodRef, int idx) {
+		DexHeader header = dexReader.getHeader();
+		int methodIdsOff = header.getMethodIdsOff();
+		absPos(methodIdsOff + idx * 8);
+		int classTypeIdx = readUShort();
+		int protoIdx = readUShort();
+		int nameIdx = readInt();
+		int protoIdsOff = header.getProtoIdsOff();
+		absPos(protoIdsOff + protoIdx * 12);
+		skip(4); 
+		int returnTypeIdx = readInt();
+		int paramsOff = readInt();
+		List<String> argTypes = readTypeListAt(paramsOff);
+		methodRef.setParentClassType(getType(classTypeIdx));
+		methodRef.setName(getString(nameIdx));
+		methodRef.setReturnType(getType(returnTypeIdx));
+		methodRef.setArgTypes(argTypes);
+	}
+	public DexMethodProto getMethodProto(int idx) {
+		int protoIdsOff = dexReader.getHeader().getProtoIdsOff();
+		absPos(protoIdsOff + idx * 12);
+		skip(4); 
+		int returnTypeIdx = readInt();
+		int paramsOff = readInt();
+		return new DexMethodProto(readTypeListAt(paramsOff), getType(returnTypeIdx));
+	}
+	public List<String> getMethodParamTypes(int idx) {
+		DexHeader header = dexReader.getHeader();
+		int methodIdsOff = header.getMethodIdsOff();
+		absPos(methodIdsOff + idx * 8 + 2);
+		int protoIdx = readUShort();
+		int protoIdsOff = header.getProtoIdsOff();
+		absPos(protoIdsOff + protoIdx * 12 + 8);
+		int paramsOff = readInt();
+		if (paramsOff == 0) {
+			return Collections.emptyList();
+		}
+		return absPos(paramsOff).readTypeList();
+	}
+	public DexReader getDexReader() {
+		return dexReader;
+	}
+	public int readUleb128() {
+		return Leb128.readUnsignedLeb128(this);
+	}
+	public int readUleb128p1() {
+		return Leb128.readUnsignedLeb128(this) - 1;
+	}
+	public int readSleb128() {
+		return Leb128.readSignedLeb128(this);
+	}
+	public int size() {
+		return buf.capacity();
+	}
+	@Override
+	public String toString() {
+		return "SectionReader{buf=" + buf + ", offset=" + offset + '}';
+	}
+}
+_______
+package jadx.plugins.input.dex.sections.annotations;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import jadx.api.plugins.input.data.annotations.AnnotationVisibility;
+import jadx.api.plugins.input.data.annotations.EncodedValue;
+import jadx.api.plugins.input.data.annotations.IAnnotation;
+import jadx.api.plugins.input.data.annotations.JadxAnnotation;
+import jadx.plugins.input.dex.DexException;
+import jadx.plugins.input.dex.sections.SectionReader;
+public class AnnotationsParser {
+	private final SectionReader in;
+	private final SectionReader ext;
+	private int offset;
+	private int fieldsCount;
+	private int methodsCount;
+	private int paramsRefCount;
+	public AnnotationsParser(SectionReader in, SectionReader ext) {
+		this.in = in;
+		this.ext = ext;
+	}
+	public AnnotationsParser copy() {
+		return new AnnotationsParser(in.copy(), ext.copy());
+	}
+	public void setOffset(int offset) {
+		this.offset = offset;
+		if (offset == 0) {
+			this.fieldsCount = 0;
+			this.methodsCount = 0;
+			this.paramsRefCount = 0;
+		} else {
+			in.setOffset(offset);
+			in.pos(4);
+			this.fieldsCount = in.readInt();
+			this.methodsCount = in.readInt();
+			this.paramsRefCount = in.readInt();
+		}
+	}
+	public List<IAnnotation> readClassAnnotations() {
+		if (offset == 0) {
+			return Collections.emptyList();
+		}
+		int classAnnotationsOffset = in.absPos(offset).readInt();
+		return readAnnotationList(classAnnotationsOffset);
+	}
+	public Map<Integer, Integer> readFieldsAnnotationOffsetMap() {
+		if (fieldsCount == 0) {
+			return Collections.emptyMap();
+		}
+		in.pos(4 * 4);
+		Map<Integer, Integer> map = new HashMap<>(fieldsCount);
+		for (int i = 0; i < fieldsCount; i++) {
+			int fieldIdx = in.readInt();
+			int fieldAnnOffset = in.readInt();
+			map.put(fieldIdx, fieldAnnOffset);
+		}
+		return map;
+	}
+	public Map<Integer, Integer> readMethodsAnnotationOffsetMap() {
+		if (methodsCount == 0) {
+			return Collections.emptyMap();
+		}
+		in.pos(4 * 4 + fieldsCount * 2 * 4);
+		Map<Integer, Integer> map = new HashMap<>(methodsCount);
+		for (int i = 0; i < methodsCount; i++) {
+			int methodIdx = in.readInt();
+			int methodAnnOffset = in.readInt();
+			map.put(methodIdx, methodAnnOffset);
+		}
+		return map;
+	}
+	public Map<Integer, Integer> readMethodParamsAnnRefOffsetMap() {
+		if (paramsRefCount == 0) {
+			return Collections.emptyMap();
+		}
+		in.pos(4 * 4 + fieldsCount * 2 * 4 + methodsCount * 2 * 4);
+		Map<Integer, Integer> map = new HashMap<>(paramsRefCount);
+		for (int i = 0; i < paramsRefCount; i++) {
+			int methodIdx = in.readInt();
+			int methodAnnRefOffset = in.readInt();
+			map.put(methodIdx, methodAnnRefOffset);
+		}
+		return map;
+	}
+	public List<IAnnotation> readAnnotationList(int offset) {
+		if (offset == 0) {
+			return Collections.emptyList();
+		}
+		in.absPos(offset);
+		int size = in.readInt();
+		if (size == 0) {
+			return Collections.emptyList();
+		}
+		List<IAnnotation> list = new ArrayList<>(size);
+		int pos = in.getAbsPos();
+		for (int i = 0; i < size; i++) {
+			in.absPos(pos + i * 4);
+			int annOffset = in.readInt();
+			in.absPos(annOffset);
+			list.add(readAnnotation(in, ext, true));
+		}
+		return list;
+	}
+	public List<List<IAnnotation>> readAnnotationRefList(int offset) {
+		if (offset == 0) {
+			return Collections.emptyList();
+		}
+		in.absPos(offset);
+		int size = in.readInt();
+		if (size == 0) {
+			return Collections.emptyList();
+		}
+		List<List<IAnnotation>> list = new ArrayList<>(size);
+		for (int i = 0; i < size; i++) {
+			int refOff = in.readInt();
+			int pos = in.getAbsPos();
+			list.add(readAnnotationList(refOff));
+			in.absPos(pos);
+		}
+		return list;
+	}
+	public static IAnnotation readAnnotation(SectionReader in, SectionReader ext, boolean readVisibility) {
+		AnnotationVisibility visibility = null;
+		if (readVisibility) {
+			int v = in.readUByte();
+			visibility = getVisibilityValue(v);
+		}
+		int typeIndex = in.readUleb128();
+		int size = in.readUleb128();
+		Map<String, EncodedValue> values = new LinkedHashMap<>(size);
+		for (int i = 0; i < size; i++) {
+			String name = ext.getString(in.readUleb128());
+			values.put(name, EncodedValueParser.parseValue(in, ext));
+		}
+		String type = ext.getType(typeIndex);
+		return new JadxAnnotation(visibility, type, values);
+	}
+	private static AnnotationVisibility getVisibilityValue(int value) {
+		switch (value) {
+			case 0:
+				return AnnotationVisibility.BUILD;
+			case 1:
+				return AnnotationVisibility.RUNTIME;
+			case 2:
+				return AnnotationVisibility.SYSTEM;
+			default:
+				throw new DexException("Unknown annotation visibility value: " + value);
+		}
+	}
+	public EncodedValue parseEncodedValue(SectionReader in) {
+		return EncodedValueParser.parseValue(in, ext);
+	}
+	public List<EncodedValue> parseEncodedArray(SectionReader in) {
+		return EncodedValueParser.parseEncodedArray(in, ext);
+	}
+}
