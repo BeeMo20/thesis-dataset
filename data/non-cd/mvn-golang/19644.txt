@@ -1,0 +1,1285 @@
+package com.igormaznitsa.mvngolang;
+import com.igormaznitsa.meta.annotation.MustNotContainNull;
+import com.igormaznitsa.meta.common.utils.ArrayUtils;
+import org.apache.maven.plugins.annotations.Parameter;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+public abstract class AbstractModuleAware extends AbstractGoPackageAndDependencyAwareMojo {
+  @Parameter(name = "mod")
+  protected String mod = null;
+  @Nullable
+  public String getMod() {
+    return findMvnProperty("mvn.golang.module.mod", this.mod);
+  }
+  @Override
+  @Nonnull
+  @MustNotContainNull
+  public final String[] getCommandFlags() {
+    final List<String> result = new ArrayList<>();
+    Collections.addAll(result, this.getAdditionalCommandFlags());
+    final String moduleMod = this.getMod();
+    if (moduleMod != null && moduleMod.trim().length() != 0) {
+      if (result.stream().anyMatch(x -> x.startsWith("-mod="))) {
+        this.getLog().warn("Detected direct 'mod' flag, configuration 'mod' option will be ignored");
+      } else {
+        this.getLog().debug("Detected mod value: " + moduleMod);
+        result.add(0, String.format("-mod=%s", moduleMod.trim()));
+      }
+    }
+    return result.toArray(new String[0]);
+  }
+  @Nonnull
+  @MustNotContainNull
+  protected String[] getAdditionalCommandFlags() {
+    return ArrayUtils.EMPTY_STRING_ARRAY;
+  }
+}
+___________
+package com.igormaznitsa.mvngolang;
+import com.igormaznitsa.meta.annotation.MustNotContainNull;
+import org.apache.maven.plugins.annotations.LifecyclePhase;
+import org.apache.maven.plugins.annotations.Mojo;
+import org.apache.maven.plugins.annotations.Parameter;
+import org.apache.maven.plugins.annotations.ResolutionScope;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+@Mojo(name = "list", defaultPhase = LifecyclePhase.PROCESS_SOURCES, threadSafe = true, requiresDependencyResolution = ResolutionScope.COMPILE)
+public class GolangListMojo extends AbstractModuleAware {
+  @Parameter(name = "format")
+  private String format = null;
+  @Parameter(name = "json")
+  private boolean json;
+  @Parameter(name = "listModules")
+  private boolean listModules;
+  public boolean isListModules() {
+    return this.listModules;
+  }
+  public boolean isJson() {
+    return this.json;
+  }
+  @Nonnull
+  @MustNotContainNull
+  @Override
+  protected String[] getAdditionalCommandFlags() {
+    final List<String> result = new ArrayList<>();
+    Collections.addAll(result, super.getAdditionalCommandFlags());
+    if (this.getFormat() != null && this.getFormat().trim().length() != 0) {
+      if (result.contains("-f")) {
+        this.getLog().warn("Format ignored because detected already defined '-f' option");
+      } else {
+        result.add("-f");
+        result.add(this.getFormat().trim());
+      }
+    }
+    if (this.isJson()) {
+      if (result.contains("-f")) {
+        this.getLog().warn("Since GoSDK 1.17, options '-f' and '-json' can't be presented together in the same time");
+      }
+      if (result.contains("-json")) {
+        this.getLog().warn("Json flag ignored because detected already defined '-json' option");
+      } else {
+        result.add("-json");
+      }
+    }
+    if (this.isListModules()) {
+      if (result.contains("-m")) {
+        this.getLog().warn("Module flag ignored because detected already defined '-m' option");
+      } else {
+        result.add("-m");
+      }
+    }
+    return result.toArray(new String[0]);
+  }
+  @Nullable
+  public String getFormat() {
+    return this.format;
+  }
+  @Nullable
+  @Override
+  protected String getSkipMojoPropertySuffix() {
+    return "list";
+  }
+  @Override
+  @Nonnull
+  public String getGoCommand() {
+    return "list";
+  }
+}
+___________
+package com.igormaznitsa.mvngolang;
+import com.igormaznitsa.meta.annotation.MustNotContainNull;
+import com.igormaznitsa.meta.common.utils.Assertions;
+import com.igormaznitsa.meta.common.utils.GetUtils;
+import com.igormaznitsa.mvngolang.cvs.CVSType;
+import com.igormaznitsa.mvngolang.utils.MavenUtils;
+import com.igormaznitsa.mvngolang.utils.PackageList;
+import com.igormaznitsa.mvngolang.utils.ProxySettings;
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.maven.plugin.MojoExecutionException;
+import org.apache.maven.plugin.MojoFailureException;
+import org.apache.maven.plugins.annotations.LifecyclePhase;
+import org.apache.maven.plugins.annotations.Mojo;
+import org.apache.maven.plugins.annotations.Parameter;
+import org.apache.maven.plugins.annotations.ResolutionScope;
+import org.codehaus.plexus.interpolation.*;
+import org.zeroturnaround.exec.InvalidExitValueException;
+import org.zeroturnaround.exec.ProcessExecutor;
+import org.zeroturnaround.exec.ProcessResult;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import java.io.File;
+import java.io.IOException;
+import java.net.URI;
+import java.text.ParseException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+@Mojo(name = "get", defaultPhase = LifecyclePhase.INITIALIZE, threadSafe = true, requiresDependencyResolution = ResolutionScope.NONE)
+public class GolangGetMojo extends AbstractModuleAware {
+  private static final Pattern PATTERN_NO_SUBMODULE_MAPPING_FOUND_IN_GIT = Pattern.compile(
+          "no\\s+submodule\\s+mapping\\s+found\\s+in\\s+.gitmodules for path\\s+\\'([\\S]+?)\\'",
+          Pattern.CASE_INSENSITIVE | Pattern.MULTILINE);
+  private static final Pattern PATTERN_EXTRACT_PACKAGE_AND_STATUS = Pattern
+          .compile("^package ([\\S]+?)\\s*:\\s*exit\\s+status\\s+([\\d]+?)\\s*$",
+                  Pattern.CASE_INSENSITIVE | Pattern.MULTILINE);
+  @Parameter(name = "customScript")
+  private CustomScript customScript;
+  @Parameter(name = "externalPackageFile")
+  private String externalPackageFile;
+  @Parameter(name = "autofixGitCache", defaultValue = "false")
+  private boolean autofixGitCache;
+  @Parameter(name = "branch")
+  private String branch;
+  @Parameter(name = "tag")
+  private String tag;
+  @Parameter(name = "revision")
+  private String revision;
+  @Parameter(name = "customCvsOptions")
+  private String[] customCvsOptions;
+  @Parameter(name = "cvsExe")
+  private String cvsExe;
+  @Parameter(name = "enforceDeletePackageFiles", defaultValue = "false")
+  private boolean enforceDeletePackageFiles;
+  @Parameter(name = "deleteCommonPkg", defaultValue = "false")
+  private boolean deleteCommonPkg;
+  @Parameter(name = "relativePathToCvsFolder")
+  private String relativePathToCvsFolder;
+  @Parameter(name = "disableCvsAutosearch", defaultValue = "false")
+  private boolean disableCvsAutosearch;
+  @Parameter(name = "allowLockSession", defaultValue = "true")
+  private boolean allowLockSession;
+  private List<PackageList.Package> integralPackageList;
+  @Nonnull
+  private static String processSlashes(@Nonnull final String str) {
+    final StringBuilder result = new StringBuilder();
+    boolean check = true;
+    for (final char c : str.toCharArray()) {
+      if (check) {
+        if (c == '\\' || c == '/') {
+          continue;
+        } else {
+          check = false;
+        }
+      }
+      if (c == '\\' || c == '/') {
+        result.append(File.separatorChar);
+      } else {
+        result.append(c);
+      }
+    }
+    while (result.length() > 0) {
+      final char last = result.charAt(result.length() - 1);
+      if (last == '/' || last == '\\') {
+        result.deleteCharAt(result.length() - 1);
+      } else {
+        break;
+      }
+    }
+    return result.toString();
+  }
+  public boolean isAllowLockSession() {
+    return this.allowLockSession;
+  }
+  public void setAllowLockSession(final boolean flag) {
+    this.allowLockSession = flag;
+  }
+  @Nullable
+  public String getExternalPackageFile() {
+    return findMvnProperty("mvn.golang.get.packages.file", this.externalPackageFile);
+  }
+  @Override
+  @Nonnull
+  @MustNotContainNull
+  public String[] getPackages() {
+    final String[] result = new String[this.integralPackageList.size()];
+    for (int i = 0; i < this.integralPackageList.size(); i++) {
+      result[i] = this.integralPackageList.get(i).getPackage();
+    }
+    return result;
+  }
+  @Nullable
+  public CustomScript getCustomScript() {
+    return this.customScript;
+  }
+  private synchronized boolean processCVS(
+      @Nonnull @MustNotContainNull final List<PackageList.Package> packages,
+      @Nullable final ProxySettings proxySettings,
+      @Nonnull @MustNotContainNull final File[] goPath) {
+    if (!packages.isEmpty()) {
+      for (final File f : goPath) {
+        for (final PackageList.Package p : packages) {
+          File rootCvsFolder = this.makePathToPackageSources(f, p.getPackage());
+          if (this.getRelativePathToCvsFolder() == null) {
+            rootCvsFolder = this.isDisableCvsAutoSearch() ? rootCvsFolder :
+                this.findRootCvsFolderForPackageSources(f, rootCvsFolder);
+          }
+          if (rootCvsFolder == null) {
+            getLog().error(
+                "Can't find CVS folder, may be it was not initially loaded from repository: " + p);
+            return false;
+          }
+          if (this.getLog().isDebugEnabled()) {
+            this.getLog().debug(String.format("CVS folder path for %s is %s", p, rootCvsFolder));
+          }
+          if (!rootCvsFolder.isDirectory()) {
+            this.getLog().error(String.format("Can't find CVS folder for package '%s' at '%s'", p,
+                rootCvsFolder.getAbsolutePath()));
+            return false;
+          } else {
+            final CVSType repo = CVSType.investigateFolder(rootCvsFolder);
+            if (repo == CVSType.UNKNOWN) {
+              this.getLog().error(
+                  "Can't recognize CVS in the folder : " + rootCvsFolder + " (for package '" + p +
+                      "')");
+              this.getLog().error(
+                  "May be to define folder directly through <relativePathToCvsFolder>...</relativePathToCvsFolder>!");
+              return false;
+            }
+            final String[] customcvs = this.getCustomCvsOptions();
+            if (customcvs != null || p.doesNeedCvsProcessing()) {
+              if (!repo.getProcessor()
+                  .prepareFolder(this.getLog(), proxySettings, this.getCvsExe(), rootCvsFolder)) {
+                this.getLog().debug("Can't prepare folder : " + rootCvsFolder);
+                return false;
+              }
+              if (customcvs != null && p.doesNeedCvsProcessing()) {
+                this.getLog().warn(
+                    "CVS branch, tag or revision are ignored for provided custom CVS options!");
+              }
+              if (customcvs != null) {
+                this.getLog().info("Custom CVS options : " + Arrays.toString(customcvs));
+                if (!repo.getProcessor()
+                    .processCVSForCustomOptions(this.getLog(), proxySettings, rootCvsFolder,
+                        this.getCvsExe(), customcvs)) {
+                  return false;
+                }
+              } else if (p.doesNeedCvsProcessing()) {
+                this.getLog().info(String
+                    .format("Switch '%s' to branch = '%s', tag = '%s', revision = '%s'", p,
+                        GetUtils.ensureNonNull(p.getBranch(), "_"),
+                        GetUtils.ensureNonNull(p.getTag(), "_"),
+                        GetUtils.ensureNonNull(p.getRevision(), "_")));
+                if (!repo.getProcessor()
+                    .processCVSRequisites(this.getLog(), proxySettings, this.getCvsExe(),
+                        rootCvsFolder, p.getBranch(), p.getTag(), p.getRevision())) {
+                  return false;
+                }
+              }
+            }
+          }
+          if (this.getCustomScript() != null) {
+            if (!processCustomScriptCallForPackage(p.getPackage(), rootCvsFolder,
+                Assertions.assertNotNull(this.getCustomScript()))) {
+              return false;
+            }
+          }
+        }
+      }
+    }
+    return true;
+  }
+  private boolean processCustomScriptCallForPackage(@Nonnull final String packageName,
+                                                    @Nonnull final File rootCvsFolder,
+                                                    @Nonnull final CustomScript script) {
+    final List<String> command = new ArrayList<>();
+    command.add(script.path);
+    if (script.options != null) {
+      command.addAll(Arrays.asList(script.options));
+    }
+    if (getLog().isDebugEnabled()) {
+      getLog().debug("CLI : " + command);
+      getLog().debug("Package name : " + packageName);
+      getLog().debug("Root CVS folder : " + rootCvsFolder);
+    }
+    getLog().warn(String.format("Starting script in VCS folder [%s] : %s", packageName,
+        StringUtils.join(command.toArray(), ' ')));
+    final ProcessExecutor processExecutor = new ProcessExecutor(command.toArray(new String[0]));
+    processExecutor
+        .exitValueAny()
+        .directory(rootCvsFolder)
+        .environment("MVNGO_CVS_BRANCH", GetUtils.ensureNonNull(this.branch, ""))
+        .environment("MVNGO_CVS_TAG", GetUtils.ensureNonNull(this.tag, ""))
+        .environment("MVNGO_CVS_REVISION", GetUtils.ensureNonNull(this.revision, ""))
+        .environment("MVNGO_CVS_PACKAGE", packageName)
+        .redirectError(System.err)
+        .redirectOutput(System.out);
+    boolean result = false;
+    try {
+      final ProcessResult process = processExecutor.executeNoTimeout();
+      final int exitValue = process.getExitValue();
+      result = script.ignoreFail || exitValue == 0;
+    } catch (IOException | InterruptedException | InvalidExitValueException ex) {
+      getLog().error("Error in custom script processing", ex);
+    }
+    return result;
+  }
+  public boolean isDisableCvsAutoSearch() {
+    return this.disableCvsAutosearch;
+  }
+  public boolean getDeleteCommonPkg() {
+    return this.deleteCommonPkg;
+  }
+  @Nullable
+  @Override
+  protected String getSkipMojoPropertySuffix() {
+    return "get";
+  }
+  @Override
+  public boolean isSkip() {
+    return super.isSkip()
+        || Boolean.parseBoolean(
+        MavenUtils.findProperty(this.getSession(), this.getProject(), "mdep.skip", "false"));
+  }
+  @Nullable
+  @MustNotContainNull
+  public String[] getCustomCvsOptions() {
+    return this.customCvsOptions;
+  }
+  @Nullable
+  public String getRelativePathToCvsFolder() {
+    return this.relativePathToCvsFolder;
+  }
+  public boolean isAutoFixGitCache() {
+    return this.autofixGitCache;
+  }
+  public boolean isEnforceDeletePackageFiles() {
+    return this.enforceDeletePackageFiles;
+  }
+  @Nullable
+  public String getRevision() {
+    return this.revision;
+  }
+  @Nullable
+  public String getBranch() {
+    return this.branch;
+  }
+  @Nullable
+  public String getTag() {
+    return this.tag;
+  }
+  @Nullable
+  public String getCvsExe() {
+    return this.cvsExe;
+  }
+  @Override
+  @Nonnull
+  public String getGoCommand() {
+    return "get";
+  }
+  @Override
+  public boolean isEnforcePrintOutput() {
+    return true;
+  }
+  @Override
+  public boolean isMojoMustNotBeExecuted() throws MojoFailureException {
+    final String[] packages = getTailArguments();
+    final boolean result;
+    if (packages.length == 0) {
+      getLog().info("There are no packages directly provided as tail arguments");
+      result = true;
+    } else {
+      result = super.isMojoMustNotBeExecuted();
+    }
+    return result;
+  }
+  @Nonnull
+  @MustNotContainNull
+  private List<String> extractProblemPackagesFromErrorLog(@Nonnull final String errorLog) {
+    final List<String> result = new ArrayList<>();
+    final Matcher extractor = PATTERN_EXTRACT_PACKAGE_AND_STATUS.matcher(errorLog);
+    while (extractor.find()) {
+      final String packageName = extractor.group(1);
+      final String status = extractor.group(2);
+      if (!"0".equals(status)) {
+        result.add(packageName);
+      }
+    }
+    return result;
+  }
+  @Nullable
+  private File findRootCvsFolderForPackageSources(@Nonnull final File rootFolder,
+                                                  @Nullable final File packageSourceFolder) {
+    File foundFile = null;
+    if (packageSourceFolder != null) {
+      final File srcFolder = getSrcFolder(rootFolder);
+      File current = packageSourceFolder;
+      while (!srcFolder.equals(current)) {
+        if (CVSType.investigateFolder(current) != CVSType.UNKNOWN) {
+          foundFile = current;
+          break;
+        }
+        current = current.getParentFile();
+      }
+    }
+    return foundFile;
+  }
+  @Nonnull
+  private File getSrcFolder(@Nonnull final File goPath) {
+    return new File(goPath, "src");
+  }
+  @Nonnull
+  private File makePathToPackageSources(@Nonnull final File goPath, @Nonnull final String pack) {
+    String path = pack.trim();
+    final String predefinedCvsPath = getRelativePathToCvsFolder();
+    if (predefinedCvsPath != null) {
+      path = processSlashes(predefinedCvsPath);
+    } else {
+      try {
+        final URI uri = URI.create(path);
+        path = processSlashes(uri.getPath());
+      } catch (IllegalArgumentException ex) {
+        path = processSlashes(path);
+      }
+    }
+    return new File(getSrcFolder(goPath), path);
+  }
+  @Nonnull
+  private File makePathToPackageCompiled(@Nonnull final File goPath, @Nonnull final String pack) {
+    String path = pack.trim();
+    try {
+      final URI uri = URI.create(path);
+      path = processSlashes(uri.getPath());
+    } catch (IllegalArgumentException ex) {
+      path = processSlashes(path);
+    }
+    return new File(goPath,
+        "pkg" + File.separatorChar + this.getOs() + '_' + this.getArch() + File.separatorChar +
+            path);
+  }
+  private boolean tryToFixGitCacheErrorsForPackages(
+      @Nonnull @MustNotContainNull final List<String> packages) throws IOException {
+    final File[] goPath = findGoPath(true);
+    int fixed = 0;
+    for (final File f : goPath) {
+      for (final String s : packages) {
+        final File packageFolder = makePathToPackageSources(f, s);
+        if (packageFolder.isDirectory()) {
+          final CVSType repo = CVSType.investigateFolder(packageFolder);
+          if (repo == CVSType.GIT) {
+            getLog().warn(String
+                .format("Executing 'git rm -r --cached .' in %s", packageFolder.getAbsolutePath()));
+            final int result = repo.getProcessor()
+                .execute(getCvsExe(), getLog(), packageFolder, "rm", "-r", "--cached", ".");
+            if (result != 0) {
+              return false;
+            }
+            fixed++;
+          } else {
+            getLog().warn(
+                String.format("Folder %s is not GIT repository", packageFolder.getAbsolutePath()));
+            return false;
+          }
+          fixed++;
+        } else {
+          getLog().debug("Folder " + packageFolder + " is not found");
+        }
+      }
+    }
+    return fixed != 0;
+  }
+  private void preparePackageList() throws MojoExecutionException {
+    final boolean debugEnabled = getLog().isDebugEnabled();
+    if (debugEnabled) {
+      getLog().debug("Preparing package list");
+    }
+    final String[] packagesInConfiguration = super.getPackages();
+    final List<PackageList.Package> list = new ArrayList<>();
+    final String extPackageFilePath = this.getExternalPackageFile();
+    if (extPackageFilePath != null) {
+      if ("none".equals(extPackageFilePath)) {
+        getLog().warn("Provided value 'none' as package list file name, so that it is ignored");
+      } else {
+        final File extFile = new File(extPackageFilePath);
+        getLog().info("Loading external package list file : " + extFile.getAbsolutePath());
+        try {
+          String text = FileUtils.readFileToString(extFile, "UTF-8");
+          if (getLog().isDebugEnabled()) {
+            getLog().debug(text);
+          }
+          text = interpolate(text);
+          list.addAll(new PackageList(extFile, text, new PackageList.ContentProvider() {
+            @Override
+            @Nonnull
+            public String readContent(@Nonnull final File contentFile) throws IOException {
+              if (!contentFile.isFile()) {
+                throw new IOException("Can't find file : " + contentFile.getAbsolutePath());
+              }
+              try {
+                String text = FileUtils.readFileToString(contentFile, "UTF-8");
+                if (getLog().isDebugEnabled()) {
+                  getLog().debug(text);
+                }
+                return interpolate(text);
+              } catch (InterpolationException ex) {
+                throw new IOException("Can't interpolate text for error", ex);
+              }
+            }
+          }).getPackages());
+        } catch (InterpolationException ex) {
+          throw new MojoExecutionException("Interpolation error with file : " + extFile, ex);
+        } catch (IOException ex) {
+          throw new MojoExecutionException("Can't load external package list file : " + extFile,
+              ex);
+        } catch (ParseException ex) {
+          throw new MojoExecutionException("Can't parse external package list file", ex);
+        }
+      }
+    } else {
+      if (debugEnabled) {
+        getLog().debug("There is no provided external package list file");
+      }
+    }
+    if (packagesInConfiguration != null && packagesInConfiguration.length > 0) {
+      for (final String p : packagesInConfiguration) {
+        list.add(new PackageList.Package(p, this.getBranch(), this.getTag(), this.getRevision()));
+      }
+    } else {
+      if (debugEnabled) {
+        getLog().debug("There are no defined packages in mojo configuration");
+      }
+    }
+    this.integralPackageList = Collections.unmodifiableList(list);
+    if (debugEnabled) {
+      for (final PackageList.Package p : this.integralPackageList) {
+        getLog().debug("Added package in list: " + p.makeString());
+      }
+    }
+  }
+  @Override
+  protected boolean doesNeedSessionLock() {
+    return this.getSession().isParallel() && this.isAllowLockSession();
+  }
+  @Override
+  public void beforeExecution(@Nullable final ProxySettings proxySettings)
+      throws MojoFailureException, MojoExecutionException {
+    preparePackageList();
+    if (getDeleteCommonPkg()) {
+      getLog().warn("Request to delete whole common pkg folder");
+      final File[] goPath;
+      try {
+        goPath = findGoPath(true);
+      } catch (IOException ex) {
+        throw new MojoExecutionException("Can't get $GOPATH", ex);
+      }
+      for (final File f : goPath) {
+        final File pkgBinary = new File(f, "pkg");
+        if (pkgBinary.isDirectory()) {
+          try {
+            FileUtils.deleteDirectory(pkgBinary);
+            getLog().warn("Folder " + pkgBinary + " has been deleted");
+          } catch (IOException ex) {
+            throw new MojoExecutionException("Can't delete PKG folder : " + pkgBinary, ex);
+          }
+        } else {
+          getLog().info("PKG folder is not found : " + pkgBinary);
+        }
+      }
+    }
+    if (isEnforceDeletePackageFiles()) {
+      int deletedInstances = 0;
+      getLog().debug(
+          "Detected request to delete both package source and binary folders if they are presented");
+      final String[] packages = this.getPackages();
+      final File[] goPath;
+      try {
+        goPath = findGoPath(true);
+      } catch (IOException ex) {
+        throw new MojoExecutionException("Can't find $GOPATH", ex);
+      }
+      if (packages != null) {
+        for (final File f : goPath) {
+          for (final String p : packages) {
+            getLog().info("Removing binary and source folders for package '" + p + "' in " + f);
+            final File pkgSources = this.makePathToPackageSources(f, p);
+            final File pkgBinary = this.makePathToPackageCompiled(f, p);
+            getLog().debug("Src folder : " + pkgSources);
+            getLog().debug("Pkg folder : " + pkgBinary);
+            if (pkgSources.isDirectory()) {
+              try {
+                FileUtils.deleteDirectory(pkgSources);
+                deletedInstances++;
+              } catch (IOException ex) {
+                throw new MojoExecutionException("Can't delete source folder : " + pkgSources, ex);
+              }
+              getLog().info("\tDeleted source folder : " + pkgSources);
+            } else {
+              getLog().debug("Folder " + pkgSources + " is not found");
+            }
+            if (pkgBinary.isDirectory()) {
+              try {
+                FileUtils.deleteDirectory(pkgBinary);
+                deletedInstances++;
+              } catch (IOException ex) {
+                throw new MojoExecutionException("Can't delete binary folder : " + pkgBinary, ex);
+              }
+              getLog().info("\tDeleted binary folder : " + pkgBinary);
+            } else {
+              final File compiled = new File(pkgBinary.getAbsolutePath() + ".a");
+              if (compiled.isFile()) {
+                if (!compiled.delete()) {
+                  throw new MojoExecutionException("Can't delete compiled file : " + compiled);
+                }
+                deletedInstances++;
+                getLog().info("\tDeleted compiled file : " + compiled);
+              } else {
+                getLog().debug("File " + compiled + " is not found");
+              }
+            }
+          }
+        }
+      }
+      if (deletedInstances > 0) {
+        try {
+          getLog().info("making 1.5 second delay to provide time for host-OS to analyze file time stamp");
+          Thread.sleep(1500L);
+        } catch (InterruptedException ex) {
+          throw new MojoExecutionException("Interrupted");
+        }
+      }
+    }
+    final String[] customCvs = this.getCustomCvsOptions();
+    boolean hasTagBranchOrRevision = false;
+    final List<PackageList.Package> packages = Assertions
+        .assertNotNull("Integral package list must be not initialized", this.integralPackageList);
+    for (final PackageList.Package p : packages) {
+      hasTagBranchOrRevision |= p.doesNeedCvsProcessing();
+      if (hasTagBranchOrRevision) {
+        break;
+      }
+    }
+    if (customCvs != null || hasTagBranchOrRevision) {
+      final File[] goPath;
+      try {
+        goPath = findGoPath(true);
+      } catch (IOException ex) {
+        throw new MojoFailureException("Can't find $GOPATH", ex);
+      }
+      getLog().info("(!) Get initial version of package repository before CVS operations");
+      this.buildFlagsToIgnore.add("-u");
+      this.addTmpBuildFlagIfNotPresented("-d");
+      try {
+        final boolean error = this.doMainBusiness(proxySettings, 10);
+        if (error) {
+          throw new Exception(
+              "error as result of 'get' operation during initial loading of packages " +
+                  Arrays.toString(this.getPackages()));
+        }
+      } catch (Exception ex) {
+        throw new MojoExecutionException("Can't get packages", ex);
+      } finally {
+        this.buildFlagsToIgnore.clear();
+        this.tempBuildFlags.clear();
+      }
+      getLog().debug(String.format("Switching branch and tag for packages : branch = %s , tag = %s",
+          GetUtils.ensureNonNull(this.branch, "..."), GetUtils.ensureNonNull(this.tag, "...")));
+      getLog().debug("Custom CVS options : " + Arrays.toString(customCvsOptions));
+      if (!processCVS(packages, proxySettings, goPath)) {
+        throw new MojoFailureException(
+            "Can't change branch or tag or execute custom CVS options, see the log for errors!");
+      }
+    }
+  }
+  @Nonnull
+  private String interpolate(@Nonnull final String str) throws IOException, InterpolationException {
+    Interpolator interpolator = new StringSearchInterpolator();
+    interpolator.addValueSource(new MapBasedValueSource(this.getProject().getProperties()));
+    interpolator.addValueSource(new MapBasedValueSource(System.getProperties()));
+    interpolator.addValueSource(new EnvarBasedValueSource());
+    return interpolator.interpolate(str);
+  }
+  @Override
+  public boolean isCommandSupportVerbose() {
+    return true;
+  }
+  @Override
+  protected boolean doesNeedOneMoreAttempt(@Nonnull final ProcessResult processResult,
+                                           @Nonnull final String consoleOut,
+                                           @Nonnull final String consoleErr)
+      throws IOException, MojoExecutionException {
+    boolean result = false;
+    if (processResult.getExitValue() != 0) {
+      final Matcher matcher = PATTERN_NO_SUBMODULE_MAPPING_FOUND_IN_GIT.matcher(consoleErr);
+      if (matcher.find()) {
+        final List<String> packagesWithDetectedGitCacheErrors =
+            extractProblemPackagesFromErrorLog(consoleErr);
+        if (!packagesWithDetectedGitCacheErrors.isEmpty()) {
+          if (this.autofixGitCache) {
+            getLog().warn("Trying to fix the detected git cache errors automatically..");
+            result = tryToFixGitCacheErrorsForPackages(packagesWithDetectedGitCacheErrors);
+          } else {
+            for (final String s : packagesWithDetectedGitCacheErrors) {
+              getLog().error(String.format(
+                  "Detected Git cache error for package '%s', can be fixed with 'git rm -r --cached .'",
+                  s));
+            }
+          }
+        }
+      }
+    }
+    return result;
+  }
+}
+___________
+package com.igormaznitsa.mvngolang;
+import com.igormaznitsa.meta.annotation.MustNotContainNull;
+import org.apache.maven.plugins.annotations.LifecyclePhase;
+import org.apache.maven.plugins.annotations.Mojo;
+import org.apache.maven.plugins.annotations.ResolutionScope;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import java.io.File;
+@Mojo(name = "fix", defaultPhase = LifecyclePhase.VALIDATE, threadSafe = true, requiresDependencyResolution = ResolutionScope.COMPILE)
+public class GolangFixMojo extends AbstractModuleAware {
+  @Override
+  public boolean isSourceFolderRequired() {
+    return true;
+  }
+  @Nullable
+  @Override
+  protected String getSkipMojoPropertySuffix() {
+    return "fix";
+  }
+  @Override
+  @Nullable
+  @MustNotContainNull
+  protected String[] getDefaultPackages() {
+    return new String[] {'.' + File.separator + "..."};
+  }
+  @Override
+  @Nonnull
+  public String getGoCommand() {
+    return "fix";
+  }
+  @Override
+  public boolean isEnforcePrintOutput() {
+    return true;
+  }
+}
+___________
+package com.igormaznitsa.mvngolang;
+import com.igormaznitsa.meta.annotation.MustNotContainNull;
+import org.apache.maven.plugins.annotations.LifecyclePhase;
+import org.apache.maven.plugins.annotations.Mojo;
+import org.apache.maven.plugins.annotations.ResolutionScope;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import java.io.File;
+@Mojo(name = "vet", defaultPhase = LifecyclePhase.VERIFY, threadSafe = true, requiresDependencyResolution = ResolutionScope.COMPILE)
+public class GolangVetMojo extends AbstractModuleAware {
+  @Override
+  @Nullable
+  @MustNotContainNull
+  protected String[] getDefaultPackages() {
+    return new String[]{'.' + File.separator + "..."};
+  }
+  @Nullable
+  @Override
+  protected String getSkipMojoPropertySuffix() {
+    return "vet";
+  }
+  @Override
+  @Nonnull
+  public String getGoCommand() {
+    return "vet";
+  }
+  @Override
+  public boolean isEnforcePrintOutput() {
+    return true;
+  }
+}
+___________
+package com.igormaznitsa.mvngolang;
+import com.igormaznitsa.meta.annotation.MustNotContainNull;
+import com.igormaznitsa.meta.common.utils.Assertions;
+import org.apache.maven.plugins.annotations.LifecyclePhase;
+import org.apache.maven.plugins.annotations.Mojo;
+import org.apache.maven.plugins.annotations.Parameter;
+import org.apache.maven.plugins.annotations.ResolutionScope;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+@Mojo(name = "mod", defaultPhase = LifecyclePhase.NONE, threadSafe = true, requiresDependencyResolution = ResolutionScope.NONE)
+public class GolangModMojo extends AbstractModuleAware {
+  @Parameter(name = "command", required = true)
+  private String command;
+  @Parameter(name = "arguments")
+  private String[] arguments;
+  @Override
+  protected boolean doesNeedSessionLock() {
+    return this.getSession().isParallel();
+  }
+  @Override
+  public boolean isModuleMode() {
+    return true;
+  }
+  @Nonnull
+  @MustNotContainNull
+  @Override
+  protected String[] getAdditionalCommandFlags() {
+    return new String[] {Assertions.assertNotNull(this.command)};
+  }
+  @Nonnull
+  @MustNotContainNull
+  @Override
+  public String[] getTailArguments() {
+    return this.arguments == null ? new String[0] : this.arguments;
+  }
+  @Nonnull
+  public String getCommand() {
+    return this.command;
+  }
+  public void setCommand(@Nonnull final String value) {
+    this.command = value;
+  }
+  @Override
+  @Nonnull
+  public String getGoCommand() {
+    return "mod";
+  }
+  @Nullable
+  @Override
+  protected String getSkipMojoPropertySuffix() {
+    return "mod";
+  }
+  @Override
+  public boolean isEnforcePrintOutput() {
+    return true;
+  }
+}
+___________
+package com.igormaznitsa.mvngolang;
+import com.igormaznitsa.meta.annotation.MustNotContainNull;
+import com.igormaznitsa.meta.common.utils.GetUtils;
+import com.igormaznitsa.mvngolang.utils.ProxySettings;
+import org.apache.maven.plugin.MojoFailureException;
+import org.apache.maven.plugins.annotations.*;
+import org.apache.maven.project.MavenProjectHelper;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import java.io.File;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import static com.igormaznitsa.meta.common.utils.Assertions.assertNotNull;
+@Mojo(name = "build", defaultPhase = LifecyclePhase.PACKAGE, threadSafe = true, requiresDependencyResolution = ResolutionScope.COMPILE)
+public class GolangBuildMojo extends AbstractModuleAware {
+  @Component
+  private MavenProjectHelper projectHelper;
+  @Parameter(name = "attach", defaultValue = "false")
+  private boolean attach;
+  @Parameter(name = "attachClassifier")
+  private String attachClassifier;
+  @Parameter(name = "attachType", defaultValue = "bin")
+  private String attachType;
+  @Parameter(name = "resultFolder", defaultValue = "${project.build.directory}")
+  private String resultFolder;
+  @Parameter(name = "resultName", defaultValue = "${project.build.finalName}")
+  private String resultName;
+  @Parameter(name = "buildMode", defaultValue = "default")
+  private String buildMode;
+  @Parameter(name = "strip", defaultValue = "false")
+  private boolean strip;
+  @Parameter(name = "ldFlags")
+  private String[] ldFlags;
+  public boolean isAttach() {
+    return Boolean.parseBoolean(findMvnProperty("mvn.golang.build.attach", Boolean.toString(this.attach)));
+  }
+  @Nullable
+  public String getAttachClassifier() {
+    return findMvnProperty("mvn.golang.build.attach.classifier", this.attachClassifier);
+  }
+  @Nonnull
+  public String getAttachType() {
+    final String found = findMvnProperty("mvn.golang.build.attach.type", this.attachType);
+    return GetUtils.ensureNonNull(found, "bin");
+  }
+  @MustNotContainNull
+  @Nonnull
+  public List<String> getLdflagsAsList() {
+    return this.ldFlags == null ? new ArrayList<>() : new ArrayList<>(Arrays.asList(this.ldFlags));
+  }
+  @Nullable
+  @Override
+  protected String getSkipMojoPropertySuffix() {
+    return "build";
+  }
+  public boolean isStrip() {
+    return this.strip;
+  }
+  public void setStrip(final boolean flag) {
+    this.strip = flag;
+  }
+  @Nonnull
+  public String getBuildMode() {
+    return this.buildMode;
+  }
+  public void setBuildMode(@Nullable final String buildMode) {
+    this.buildMode = GetUtils.ensureNonNull(buildMode, "default");
+  }
+  @Nonnull
+  private File getResultFile() {
+    return new File(getResultFolder(), this.getResultName());
+  }
+  @Nonnull
+  public String getResultFolder() {
+    return assertNotNull(this.resultFolder);
+  }
+  public void setResultFolder(@Nonnull final String folder) {
+    this.resultFolder = assertNotNull(folder);
+  }
+  @Nonnull
+  public String getResultName() {
+    return assertNotNull(this.resultName);
+  }
+  public void setResultName(@Nonnull final String resultName) {
+    this.resultName = assertNotNull(resultName);
+  }
+  @Override
+  @Nonnull
+  public String getGoCommand() {
+    return "build";
+  }
+  @Override
+  public void beforeExecution(@Nullable final ProxySettings proxySettings)
+      throws MojoFailureException {
+    final File folder = new File(getResultFolder());
+    if (!folder.isDirectory() && !folder.mkdirs()) {
+      throw new MojoFailureException("Can't create folder : " + folder);
+    }
+    if (isVerbose() || !"default".equals(this.buildMode)) {
+      getLog().info("Build mode : " + this.buildMode);
+    }
+    final String[] currentPackages = this.getPackages();
+    if (currentPackages != null && currentPackages.length > 1) {
+      getLog().warn(String.format(
+          "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!%n"
+              + "!Result file output is ignored because non-single package!%n"
+              + "!            see: 'go help build' for more info          !%n"
+              + "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+      );
+    }
+  }
+  @Override
+  public void afterExecution(@Nullable final ProxySettings proxySettings, final boolean error)
+      throws MojoFailureException {
+    if (!error) {
+      final File resultFile = getResultFile();
+      if (!resultFile.isFile()) {
+        throw new MojoFailureException("Can't find generated target file : " + resultFile);
+      }
+      try {
+        if (!resultFile.setExecutable(true)) {
+          getLog().warn("Can't make result file executable : " + resultFile);
+        }
+      } catch (SecurityException ex) {
+        getLog().warn("Security exception during executable flag set : " + resultFile);
+      }
+      getLog().info("The Result file has been successfully created : " + resultFile);
+      this.processAttach(resultFile);
+    }
+  }
+  @Override
+  public boolean isCommandSupportVerbose() {
+    return true;
+  }
+  private void processAttach(@Nonnull final File resultFile) {
+    if (this.isAttach()) {
+      final String classifier = this.getAttachClassifier();
+      final String type = this.getAttachType();
+      this.getLog().info("Activated attach as artifact (classifier=" + classifier + ", type=" + type + "): " + resultFile);
+      this.projectHelper.attachArtifact(this.getProject(), type, classifier, resultFile);
+    } else {
+      this.getLog().debug("Attach as artifact is turned off");
+    }
+  }
+  @Override
+  @Nonnull
+  @MustNotContainNull
+  protected String[] getAdditionalCommandFlags() {
+    final List<String> flags = new ArrayList<>();
+    flags.add("-buildmode=" + this.getBuildMode());
+    final List<String> linkerFlags = this.getLdflagsAsList();
+    if (this.strip) {
+      if (!linkerFlags.contains("-s")) {
+        linkerFlags.add("-s");
+      }
+      if (!linkerFlags.contains("-w")) {
+        linkerFlags.add("-w");
+      }
+    }
+    if (!linkerFlags.isEmpty()) {
+      flags.add("-ldflags");
+      final StringBuilder buffer = new StringBuilder();
+      for (final String s : linkerFlags) {
+        if (buffer.length() > 0) {
+          buffer.append(' ');
+        }
+        buffer.append(s);
+      }
+      flags.add(buffer.toString());
+    }
+    final String[] selectedPackages = this.getPackages();
+    final String selectedResultName = this.getResultName();
+    if (selectedPackages == null || selectedPackages.length < 2) {
+      if ("none".equals(selectedResultName.trim())) {
+        this.getLog().info("Result name is not defined so that '-o' option is not added.");
+      } else {
+        flags.add("-o");
+        flags.add(this.getResultFile().getAbsolutePath());
+      }
+    }
+    return flags.toArray(new String[0]);
+  }
+}
+___________
+package com.igormaznitsa.mvngolang;
+import com.igormaznitsa.mvngolang.utils.MavenUtils;
+import org.apache.maven.plugins.annotations.LifecyclePhase;
+import org.apache.maven.plugins.annotations.Mojo;
+import org.apache.maven.plugins.annotations.ResolutionScope;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+@Mojo(name = "install", defaultPhase = LifecyclePhase.DEPLOY, threadSafe = true, requiresDependencyResolution = ResolutionScope.COMPILE)
+public class GolangInstallMojo extends AbstractModuleAware {
+  @Nullable
+  @Override
+  protected String getSkipMojoPropertySuffix() {
+    return "install";
+  }
+  @Override
+  public boolean isSkip() {
+    return super.isSkip()
+        || Boolean.parseBoolean(MavenUtils
+        .findProperty(this.getSession(), this.getProject(), "maven.deploy.skip", "false"));
+  }
+  @Override
+  @Nonnull
+  public String getGoCommand() {
+    return "install";
+  }
+  @Override
+  public boolean isSourceFolderRequired() {
+    return true;
+  }
+  @Override
+  public boolean isEnforcePrintOutput() {
+    return true;
+  }
+}
+___________
+package com.igormaznitsa.mvngolang;
+import com.igormaznitsa.meta.annotation.MustNotContainNull;
+import com.igormaznitsa.meta.common.utils.ArrayUtils;
+import com.igormaznitsa.meta.common.utils.GetUtils;
+import com.igormaznitsa.mvngolang.utils.MavenUtils;
+import org.apache.maven.plugins.annotations.LifecyclePhase;
+import org.apache.maven.plugins.annotations.Mojo;
+import org.apache.maven.plugins.annotations.Parameter;
+import org.apache.maven.plugins.annotations.ResolutionScope;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
+@Mojo(name = "test", defaultPhase = LifecyclePhase.TEST, threadSafe = true, requiresDependencyResolution = ResolutionScope.TEST)
+public class GolangTestMojo extends AbstractModuleAware {
+  @Parameter(name = "testFlags")
+  private String[] testFlags;
+  @Nonnull
+  private String ensureGoExtension(@Nonnull final String name) {
+    return name.endsWith(".go") ? name : name + ".go";
+  }
+  @Nullable
+  @Override
+  protected String getSkipMojoPropertySuffix() {
+    return "test";
+  }
+  @Override
+  public boolean isSkip() {
+    return super.isSkip()
+        || Boolean.getBoolean("skipTests")
+        || Boolean.parseBoolean(
+        MavenUtils.findProperty(this.getSession(), this.getProject(), "maven.test.skip", "false"));
+  }
+  @Override
+  @Nullable
+  @MustNotContainNull
+  protected String[] getDefaultPackages() {
+    final String definedTest = System.getProperty("test");
+    if (definedTest != null) {
+      final int index = definedTest.indexOf('#');
+      final String[] name;
+      if (index >= 0) {
+        name = new String[] {definedTest.substring(0, index), definedTest.substring(index + 1)};
+      } else {
+        name = new String[] {definedTest};
+      }
+      final List<String> result = new ArrayList<>();
+      result.add(ensureGoExtension(name[0]));
+      if (definedTest.length() > 1) {
+        result.add("-run");
+        result.add(name[1]);
+      }
+      return result.toArray(new String[0]);
+    } else {
+      return new String[] {'.' + File.separator + "..."};
+    }
+  }
+  @Override
+  public boolean isIgnoreErrorExitCode() {
+    return Boolean.parseBoolean(MavenUtils
+        .findProperty(this.getSession(), this.getProject(), "maven.test.failure.ignore", "false"))
+        || super.isIgnoreErrorExitCode();
+  }
+  @Nullable
+  @MustNotContainNull
+  public String[] getTestFlags() {
+    return this.testFlags == null ? null : this.testFlags.clone();
+  }
+  @Override
+  public boolean isSourceFolderRequired() {
+    return true;
+  }
+  @Override
+  @Nonnull
+  @MustNotContainNull
+  public String[] getOptionalExtraTailArguments() {
+    return GetUtils.ensureNonNull(this.testFlags, ArrayUtils.EMPTY_STRING_ARRAY);
+  }
+  @Override
+  @Nonnull
+  public String getGoCommand() {
+    return "test";
+  }
+  @Override
+  public boolean isEnforcePrintOutput() {
+    return true;
+  }
+}
+___________
+package com.igormaznitsa.mvngolang;
+import com.igormaznitsa.meta.annotation.MustNotContainNull;
+import org.apache.maven.plugins.annotations.LifecyclePhase;
+import org.apache.maven.plugins.annotations.Mojo;
+import org.apache.maven.plugins.annotations.ResolutionScope;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import java.io.File;
+@Mojo(name = "generate", defaultPhase = LifecyclePhase.GENERATE_SOURCES, threadSafe = true, requiresDependencyResolution = ResolutionScope.COMPILE)
+public class GolangGenerateMojo extends AbstractModuleAware {
+  @Override
+  @Nonnull
+  public String getGoCommand() {
+    return "generate";
+  }
+  @Nullable
+  @Override
+  protected String getSkipMojoPropertySuffix() {
+    return "generate";
+  }
+  @Override
+  @Nullable
+  @MustNotContainNull
+  protected String[] getDefaultPackages() {
+    return new String[] {'.' + File.separator + "..."};
+  }
+  @Override
+  public boolean isSourceFolderRequired() {
+    return true;
+  }
+  @Override
+  public boolean isEnforcePrintOutput() {
+    return true;
+  }
+}
+___________
+package com.igormaznitsa.mvngolang;
+import com.igormaznitsa.meta.annotation.MustNotContainNull;
+import com.igormaznitsa.meta.common.utils.ArrayUtils;
+import org.apache.maven.plugins.annotations.LifecyclePhase;
+import org.apache.maven.plugins.annotations.Mojo;
+import org.apache.maven.plugins.annotations.Parameter;
+import org.apache.maven.plugins.annotations.ResolutionScope;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+@SuppressWarnings("SpellCheckingInspection")
+@Mojo(name = "run", defaultPhase = LifecyclePhase.PACKAGE, threadSafe = true, requiresDependencyResolution = ResolutionScope.COMPILE_PLUS_RUNTIME)
+public class GolangRunMojo extends AbstractModuleAware {
+  @Parameter(name = "xprog")
+  private String xprog;
+  @Parameter(name = "args")
+  private String[] args;
+  @Nonnull
+  @MustNotContainNull
+  public String[] getArgs() {
+    return this.args == null ? ArrayUtils.EMPTY_STRING_ARRAY : this.args.clone();
+  }
+  @Override
+  @Nonnull
+  @MustNotContainNull
+  public String[] getTailArguments() {
+    final List<String> result = new ArrayList<>(Arrays.asList(super.getTailArguments()));
+    result.addAll(Arrays.asList(this.getArgs()));
+    return result.toArray(new String[0]);
+  }
+  @Override
+  public boolean isSourceFolderRequired() {
+    return true;
+  }
+  @Override
+  @Nonnull
+  @MustNotContainNull
+  protected String[] getExtraBuildFlags() {
+    String[] result = ArrayUtils.EMPTY_STRING_ARRAY;
+    if (this.xprog != null) {
+      result = new String[] {"-exec", this.xprog};
+    }
+    return result;
+  }
+  @Nullable
+  @Override
+  protected String getSkipMojoPropertySuffix() {
+    return "run";
+  }
+  @Override
+  @Nonnull
+  public String getGoCommand() {
+    return "run";
+  }
+  @Override
+  public boolean isEnforcePrintOutput() {
+    return true;
+  }
+}
